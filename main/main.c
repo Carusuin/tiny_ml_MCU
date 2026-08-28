@@ -14,9 +14,13 @@
 #include "nvs_flash.h"
 
 #include "kwp2000.h"
+#include "sd_logger.h"
 
 static const char *TAG = "APP_MAIN";
 
+// Use hardware UART pins, not bit-banged GPIO.
+// ESP32 UART1: GPIO16 = RX, GPIO17 = TX.
+#define KLINE_UART_NUM UART_NUM_1
 #define KLINE_RX_GPIO  16
 #define KLINE_TX_GPIO  17
 #define KLINE_BAUDRATE 10400
@@ -32,6 +36,7 @@ typedef struct {
     uint8_t dtc_count;
     uint32_t timestamp_ms;
     char status_text[32];
+    bool sd_card_available;
 } ecu_status_t;
 
 static QueueHandle_t ecu_queue = NULL;
@@ -42,7 +47,8 @@ static ecu_status_t current_status = {
     .coolant_temp_c = 0,
     .dtc_count = 0,
     .timestamp_ms = 0,
-    .status_text = "waiting"
+    .status_text = "waiting",
+    .sd_card_available = false
 };
 
 static const char *dashboard_html = R"html(
@@ -81,6 +87,10 @@ static const char *dashboard_html = R"html(
     <div class="label">DTC Codes</div>
     <div id="dtcList" style="margin-top:12px;">Loading...</div>
   </div>
+  <div class="row" style="margin-top:20px;">
+    <div class="label">SD Logger</div>
+    <div id="sdState" class="warn">Checking...</div>
+  </div>
   <script>
     async function loadStatus() {
       try {
@@ -90,6 +100,9 @@ static const char *dashboard_html = R"html(
         document.getElementById('speed').textContent = data.speed_kph + ' km/h';
         document.getElementById('coolant').textContent = data.coolant_temp_c + ' C';
         document.getElementById('dtc').textContent = data.dtc_count;
+        const sdEl = document.getElementById('sdState');
+        sdEl.textContent = data.sd_card_available ? 'SD card ready' : 'SD card not detected';
+        sdEl.className = data.sd_card_available ? 'status' : 'warn';
         const stateEl = document.getElementById('state');
         if (data.ecu_connected) {
           stateEl.textContent = 'ECU connected';
@@ -139,13 +152,14 @@ static esp_err_t status_json_handler(httpd_req_t *req)
 {
     char json[256];
     snprintf(json, sizeof(json),
-        "{\"ecu_connected\":%s,\"rpm\":%u,\"speed_kph\":%u,\"coolant_temp_c\":%u,\"dtc_count\":%u,\"status_text\":\"%s\"}",
+        "{\"ecu_connected\":%s,\"rpm\":%u,\"speed_kph\":%u,\"coolant_temp_c\":%u,\"dtc_count\":%u,\"status_text\":\"%s\",\"sd_card_available\":%s}",
         current_status.ecu_connected ? "true" : "false",
         current_status.rpm,
         current_status.speed_kph,
         current_status.coolant_temp_c,
         current_status.dtc_count,
-        current_status.status_text);
+        current_status.status_text,
+        current_status.sd_card_available ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -189,6 +203,13 @@ static void queue_consumer_task(void *arg)
     while (1) {
         if (xQueueReceive(ecu_queue, &status, pdMS_TO_TICKS(200)) == pdTRUE) {
             current_status = status;
+            current_status.sd_card_available = sd_logger_is_available();
+            sd_logger_log_ecu_status(status.timestamp_ms,
+                                     status.ecu_connected,
+                                     status.rpm,
+                                     status.speed_kph,
+                                     status.coolant_temp_c,
+                                     status.dtc_count);
             ESP_LOGI(TAG, "Queued status: connected=%d rpm=%u speed=%u coolant=%u dtc=%u",
                      status.ecu_connected,
                      status.rpm,
@@ -312,6 +333,12 @@ void app_main(void)
         return;
     }
 
+    bool sd_ready = sd_logger_init();
+    current_status.sd_card_available = sd_ready;
+    if (!sd_ready) {
+        ESP_LOGW(TAG, "SD logger unavailable; continuing without SD logging");
+    }
+
     wifi_init_softap();
     start_webserver();
 
@@ -330,4 +357,3 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Application initialized");
 }
-

@@ -9,6 +9,7 @@
 
 static const char *TAG = "KWP2000";
 
+// Use ESP32 hardware UART1 for K-Line communication.
 #define KWP_UART_NUM           UART_NUM_1
 #define KWP_UART_BUFFER_SIZE   512
 #define KWP_RX_TIMEOUT_MS      1000
@@ -143,6 +144,7 @@ void kwp2000_init(int rx_gpio, int tx_gpio, int baudrate)
     
     uart_param_config(KWP_UART_NUM, &uart_config);
     uart_set_pin(KWP_UART_NUM, tx_gpio, rx_gpio, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_set_line_inverse(KWP_UART_NUM, UART_SIGNAL_TXD_INV | UART_SIGNAL_RXD_INV);
     uart_driver_install(KWP_UART_NUM, KWP_UART_BUFFER_SIZE, KWP_UART_BUFFER_SIZE, 0, NULL, 0);
     
     ESP_LOGI(TAG, "UART initialized on pins RX=%d, TX=%d, Baudrate=%d", rx_gpio, tx_gpio, baudrate);
