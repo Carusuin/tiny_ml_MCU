@@ -95,10 +95,10 @@ idf.py -p COM3 monitor
 │   Core 0    │       Core 1          │
 ├─────────────┼───────────────────────┤
 │             │                       │
-│  Main App   │   KWP2000 Task       │
-│  TinyML     │   (UART Receiver)    │
-│  Web Server │   (Frame Parser)     │
-│             │   (Queue Manager)    │
+│  Main App   │   KWP2000 Task        │
+│  TinyML     │   (UART Receiver)     │
+│  Web Server │   (Frame Parser)      │
+│             │   (Queue Manager)     │
 │             │                       │
 └─────────────┴───────────────────────┘
        ↕              ↕

@@ -6,6 +6,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define KWP_FRAME_MAX_SIZE 256
 
 // KWP2000 Service IDs
@@ -43,6 +47,18 @@ typedef struct {
 // Initialize KWP2000 UART and task
 void kwp2000_init(int rx_gpio, int tx_gpio, int baudrate);
 
+// Send the K-Line fast-initialization wake-up pattern before UART traffic.
+bool kwp2000_fast_init(void);
+
+// Force the TX logic level for hardware testing. The UART must be idle.
+bool kwp2000_start_tx_hardware_test(bool force_low);
+void kwp2000_stop_tx_hardware_test(void);
+
+// Run Fast Init, start UART communication, and open a diagnostic session.
+bool kwp2000_begin_diagnostic_session(uint8_t session_type);
+
+bool kwp2000_is_initialized(void);
+
 // Send KWP2000 frame
 bool kwp2000_send_frame(kwp2000_frame_t *frame);
 
@@ -69,5 +85,9 @@ bool kwp2000_start_diagnostic_session(uint8_t session_type);
 
 // Get KWP2000 response queue
 QueueHandle_t kwp2000_get_response_queue(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // KWP2000_H
