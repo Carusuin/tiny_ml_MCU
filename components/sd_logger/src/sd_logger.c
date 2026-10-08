@@ -85,20 +85,20 @@ bool sd_logger_log_ecu_status(uint32_t timestamp_ms,
                               bool ecu_connected,
                               uint16_t rpm,
                               uint16_t speed_kph,
-                              uint8_t coolant_temp_c,
+                              int16_t coolant_temp_c,
                               uint8_t dtc_count)
 {
     if (!sd_available || log_file == NULL) {
         return false;
     }
 
-    int written = fprintf(log_file, "%lu,%d,%u,%u,%u,%u\n",
+    int written = fprintf(log_file, "%lu,%d,%u,%u,%d,%u\n",
                           (unsigned long)timestamp_ms,
                           ecu_connected ? 1 : 0,
-                          rpm,
-                          speed_kph,
+                          (unsigned)rpm,
+                          (unsigned)speed_kph,
                           coolant_temp_c,
-                          dtc_count);
+                          (unsigned)dtc_count);
     if (written < 0) {
         ESP_LOGE(TAG, "SD write failed; disabling logger");
         fclose(log_file);

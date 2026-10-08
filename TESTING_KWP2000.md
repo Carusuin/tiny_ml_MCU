@@ -3,6 +3,26 @@
 ## Overview
 Ini adalah setup untuk test komunikasi KWP2000 antara ESP32 dan ECU emulator (Python) **tanpa hardware real**.
 
+## Profil timing dan pemetaan sensor (uji AGY)
+
+Firmware saat ini memakai Fast Init LOW 25 ms + HIGH 25 ms, W4 0 ms, UART
+10400 baud 8N1 inverted, timeout respons 120 ms, dan jeda TX 1 ms di antara
+byte. ACK wake-up standar `0E 04 72 7C` tetap diterima; dua varian yang
+dilaporkan AGY (`0E 04 72` tanpa checksum dan `72 8C`) juga diterima untuk uji.
+Untuk tabel data ID `0x10`, pemetaan uji diterapkan langsung ke indeks response
+yang dikembalikan (byte ID berada di indeks 0):
+
+| Sensor | Indeks response | Konversi |
+|--------|-----------------|----------|
+| TPS | `0x05` | raw × 0,5% |
+| RPM | `0x06`–`0x07` | unsigned 16-bit, byte besar lebih dulu |
+| ECT/EOT | `0x08` | raw − 40 °C |
+| MAP | `0x0B` | raw × 0,75 kPa |
+
+Ini masih profil uji dari hasil analisis AGY, belum terkonfirmasi terhadap
+respons ECU nyata. Verifikasi timing, format ACK, indeks, dan skala dengan data
+respons aktual sebelum menganggap komunikasi atau nilai sensor tervalidasi.
+
 ## Requirements
 1. **Python 3.6+** dengan library `pyserial`
 2. **Virtual Serial Port Emulator** (untuk membuat COM port pair)

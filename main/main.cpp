@@ -4,9 +4,10 @@
 #include <stdarg.h>
 
 #include "freertos/FreeRTOS.h"
-#include "esp_timer.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -27,8 +28,16 @@ static const char *TAG = "APP_MAIN";
 static char web_log_lines[WEB_LOG_LINE_COUNT][WEB_LOG_LINE_SIZE];
 static size_t web_log_count = 0;
 static size_t web_log_next = 0;
-static portMUX_TYPE web_log_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Gunakan Mutex untuk log buffer & status (bukan Critical Section)
+static SemaphoreHandle_t web_log_mutex = NULL;
+static SemaphoreHandle_t status_mutex = NULL;
+static SemaphoreHandle_t kwp_mutex = NULL;
+static SemaphoreHandle_t diagnostic_request_sem = NULL;
+static SemaphoreHandle_t diagnostic_state_mutex = NULL;
+
 static vprintf_like_t web_log_previous_vprintf = NULL;
+static bool diagnostic_request_active = false;
 
 static int web_log_vprintf(const char *format, va_list args)
 {
@@ -46,14 +55,15 @@ static int web_log_vprintf(const char *format, va_list args)
     va_end(capture_args);
 
     if (strstr(line, "KWP2000:") != NULL || strstr(line, "APP_MAIN:") != NULL) {
-        portENTER_CRITICAL(&web_log_lock);
-        strncpy(web_log_lines[web_log_next], line, WEB_LOG_LINE_SIZE - 1);
-        web_log_lines[web_log_next][WEB_LOG_LINE_SIZE - 1] = '\0';
-        web_log_next = (web_log_next + 1) % WEB_LOG_LINE_COUNT;
-        if (web_log_count < WEB_LOG_LINE_COUNT) {
-            web_log_count++;
+        if (web_log_mutex && xSemaphoreTake(web_log_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            strncpy(web_log_lines[web_log_next], line, WEB_LOG_LINE_SIZE - 1);
+            web_log_lines[web_log_next][WEB_LOG_LINE_SIZE - 1] = '\0';
+            web_log_next = (web_log_next + 1) % WEB_LOG_LINE_COUNT;
+            if (web_log_count < WEB_LOG_LINE_COUNT) {
+                web_log_count++;
+            }
+            xSemaphoreGive(web_log_mutex);
         }
-        portEXIT_CRITICAL(&web_log_lock);
     }
 
     return result;
@@ -61,14 +71,13 @@ static int web_log_vprintf(const char *format, va_list args)
 
 static void web_log_clear(void)
 {
-    portENTER_CRITICAL(&web_log_lock);
-    web_log_count = 0;
-    web_log_next = 0;
-    portEXIT_CRITICAL(&web_log_lock);
+    if (web_log_mutex && xSemaphoreTake(web_log_mutex, portMAX_DELAY) == pdTRUE) {
+        web_log_count = 0;
+        web_log_next = 0;
+        xSemaphoreGive(web_log_mutex);
+    }
 }
 
-// Use hardware UART pins, not bit-banged GPIO.
-// ESP32 UART1: GPIO16 = RX, GPIO17 = TX.
 #define KLINE_UART_NUM UART_NUM_1
 #define KLINE_RX_GPIO  16
 #define KLINE_TX_GPIO  17
@@ -84,7 +93,9 @@ typedef struct {
     bool ecu_connected;
     uint16_t rpm;
     uint16_t speed_kph;
-    uint8_t coolant_temp_c;
+    int16_t coolant_temp_c;
+    uint16_t tps_percent_tenths;
+    uint16_t map_kpa_quarters;
     uint8_t dtc_count;
     uint32_t timestamp_ms;
     char status_text[32];
@@ -97,6 +108,8 @@ static ecu_status_t current_status = {
     .rpm = 0,
     .speed_kph = 0,
     .coolant_temp_c = 0,
+    .tps_percent_tenths = 0,
+    .map_kpa_quarters = 0,
     .dtc_count = 0,
     .timestamp_ms = 0,
     .status_text = "waiting",
@@ -133,6 +146,8 @@ static const char *dashboard_html = R"html(
     <div class="card"><div class="label">RPM</div><div id="rpm" class="value">0</div></div>
     <div class="card"><div class="label">Speed</div><div id="speed" class="value">0 km/h</div></div>
     <div class="card"><div class="label">Coolant</div><div id="coolant" class="value">0 C</div></div>
+    <div class="card"><div class="label">TPS</div><div id="tps" class="value">0.0%</div></div>
+    <div class="card"><div class="label">MAP</div><div id="map" class="value">0.00 kPa</div></div>
     <div class="card"><div class="label">DTC</div><div id="dtc" class="value">0</div></div>
   </div>
   <div class="card" style="margin-top:20px;">
@@ -164,100 +179,84 @@ static const char *dashboard_html = R"html(
   <script>
     async function loadStatus() {
       try {
-        const statusRes = await fetch('/api/status');
-        const data = await statusRes.json();
+        const response = await fetch('/api/status');
+        const data = await response.json();
         document.getElementById('rpm').textContent = data.rpm + ' rpm';
         document.getElementById('speed').textContent = data.speed_kph + ' km/h';
         document.getElementById('coolant').textContent = data.coolant_temp_c + ' C';
+        document.getElementById('tps').textContent =
+          (data.tps_percent_tenths / 10).toFixed(1) + '%';
+        document.getElementById('map').textContent =
+          (data.map_kpa_quarters / 4).toFixed(2) + ' kPa';
         document.getElementById('dtc').textContent = data.dtc_count;
-        const sdEl = document.getElementById('sdState');
-        sdEl.textContent = data.sd_card_available ? 'SD card ready' : 'SD card not detected';
-        sdEl.className = data.sd_card_available ? 'status' : 'warn';
-        const stateEl = document.getElementById('state');
-        if (data.ecu_connected) {
-          stateEl.textContent = 'ECU connected';
-          stateEl.className = 'status';
-        } else {
-          stateEl.textContent = 'Waiting for ECU';
-          stateEl.className = 'warn';
-        }
-      } catch (err) {
+        const sd = document.getElementById('sdState');
+        sd.textContent = data.sd_card_available ? 'SD card ready' : 'SD card not detected';
+        sd.className = data.sd_card_available ? 'status' : 'warn';
+        const state = document.getElementById('state');
+        state.textContent = data.ecu_connected ? 'ECU connected' : 'Waiting for ECU';
+        state.className = data.ecu_connected ? 'status' : 'warn';
+      } catch (error) {
         document.getElementById('state').textContent = 'Error';
         document.getElementById('state').className = 'bad';
       }
     }
-
     async function loadDtc() {
       try {
-        const res = await fetch('/api/dtc');
-        const data = await res.json();
-        const dtcList = document.getElementById('dtcList');
-        if (data && data.codes && data.codes.length > 0) {
-          dtcList.innerHTML = data.codes.map(code => '<div>' + code + '</div>').join('');
-        } else {
-          dtcList.textContent = 'No DTC codes';
-        }
-      } catch (err) {
+        const response = await fetch('/api/dtc');
+        const data = await response.json();
+        const list = document.getElementById('dtcList');
+        list.innerHTML = data.codes && data.codes.length
+          ? data.codes.map(code => '<div>' + code + '</div>').join('')
+          : 'No DTC codes';
+      } catch (error) {
         document.getElementById('dtcList').textContent = 'Unable to fetch DTC';
       }
     }
-
     async function startDiagnostic() {
       const button = document.getElementById('initButton');
       const message = document.getElementById('initMessage');
       button.disabled = true;
       message.textContent = 'Starting K-Line initialization...';
       try {
-        const res = await fetch('/api/start-diagnostic', { method: 'POST' });
-        const data = await res.json();
-        message.textContent = data.success
-          ? 'K-Line communication started'
-          : 'K-Line initialization failed';
-        await loadStatus();
-      } catch (err) {
+        const response = await fetch('/api/start-diagnostic', { method: 'POST' });
+        const data = await response.json();
+        message.textContent = data.message || (data.success
+          ? 'K-Line communication started' : 'K-Line initialization failed');
+      } catch (error) {
         message.textContent = 'Request failed';
       } finally {
         button.disabled = false;
       }
     }
-
     async function loadLogs() {
       try {
-        const res = await fetch('/api/logs');
-        const data = await res.json();
-        const logEl = document.getElementById('serialLog');
-        const wasAtBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
-        logEl.textContent = data.lines.join('');
-        if (wasAtBottom) {
-          logEl.scrollTop = logEl.scrollHeight;
-        }
-      } catch (err) {
+        const response = await fetch('/api/logs');
+        const data = await response.json();
+        const log = document.getElementById('serialLog');
+        const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
+        log.textContent = data.lines.join('');
+        if (atBottom) log.scrollTop = log.scrollHeight;
+      } catch (error) {
         document.getElementById('serialLog').textContent = 'Unable to fetch serial log';
       }
     }
-
     async function clearLogs() {
       await fetch('/api/logs/clear', { method: 'POST' });
       await loadLogs();
     }
-
     async function setTxTest(level) {
-      const res = await fetch('/api/tx-test/' + level, { method: 'POST' });
-      const data = await res.json();
+      const response = await fetch('/api/tx-test/' + level, { method: 'POST' });
+      const data = await response.json();
       document.getElementById('txTestMessage').textContent =
         data.success ? 'TX forced ' + level.toUpperCase() + ' for up to 45 seconds' : data.error;
     }
-
     async function stopTxTest() {
-      const res = await fetch('/api/tx-test/stop', { method: 'POST' });
-      const data = await res.json();
+      const response = await fetch('/api/tx-test/stop', { method: 'POST' });
+      const data = await response.json();
       document.getElementById('txTestMessage').textContent =
         data.success ? 'TX released' : data.error;
     }
-
-    loadStatus();
-    loadDtc();
-    loadLogs();
+    loadStatus(); loadDtc(); loadLogs();
     setInterval(loadStatus, 1000);
     setInterval(loadDtc, 3000);
     setInterval(loadLogs, 500);
@@ -269,26 +268,7 @@ static const char *dashboard_html = R"html(
 static esp_err_t dashboard_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, dashboard_html, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-static esp_err_t status_json_handler(httpd_req_t *req)
-{
-    char json[256];
-    snprintf(json, sizeof(json),
-        "{\"ecu_connected\":%s,\"rpm\":%u,\"speed_kph\":%u,\"coolant_temp_c\":%u,\"dtc_count\":%u,\"status_text\":\"%s\",\"sd_card_available\":%s}",
-        current_status.ecu_connected ? "true" : "false",
-        current_status.rpm,
-        current_status.speed_kph,
-        current_status.coolant_temp_c,
-        current_status.dtc_count,
-        current_status.status_text,
-        current_status.sd_card_available ? "true" : "false");
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
+    return httpd_resp_send(req, dashboard_html, HTTPD_RESP_USE_STRLEN);
 }
 
 static const httpd_uri_t uri_root = {
@@ -297,6 +277,37 @@ static const httpd_uri_t uri_root = {
     .handler = dashboard_get_handler,
     .user_ctx = NULL,
 };
+
+static esp_err_t status_json_handler(httpd_req_t *req)
+{
+    char json[320];
+    ecu_status_t snapshot_status;
+
+    if (status_mutex == NULL ||
+        xSemaphoreTake(status_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Status lock busy");
+        return ESP_FAIL;
+    }
+    snapshot_status = current_status;
+    xSemaphoreGive(status_mutex);
+
+    snprintf(json, sizeof(json),
+        "{\"ecu_connected\":%s,\"rpm\":%u,\"speed_kph\":%u,\"coolant_temp_c\":%d,\"tps_percent_tenths\":%u,\"map_kpa_quarters\":%u,\"dtc_count\":%u,\"status_text\":\"%s\",\"sd_card_available\":%s}",
+        snapshot_status.ecu_connected ? "true" : "false",
+        (unsigned)snapshot_status.rpm,
+        (unsigned)snapshot_status.speed_kph,
+        (int)snapshot_status.coolant_temp_c,
+        (unsigned)snapshot_status.tps_percent_tenths,
+        (unsigned)snapshot_status.map_kpa_quarters,
+        (unsigned)snapshot_status.dtc_count,
+        snapshot_status.status_text,
+        snapshot_status.sd_card_available ? "true" : "false");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
 
 static const httpd_uri_t uri_status = {
     .uri = "/api/status",
@@ -307,11 +318,20 @@ static const httpd_uri_t uri_status = {
 
 static esp_err_t dtc_json_handler(httpd_req_t *req)
 {
-    char json[256];
-    snprintf(json, sizeof(json),
-        "{\"dtc_count\":%u,\"codes\":[\"P0300\",\"P0171\"]}",
-        current_status.dtc_count);
+    ecu_status_t snapshot_status;
+    if (status_mutex == NULL ||
+        xSemaphoreTake(status_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Status lock busy");
+        return ESP_FAIL;
+    }
+    snapshot_status = current_status;
+    xSemaphoreGive(status_mutex);
 
+    char json[128];
+    snprintf(json, sizeof(json),
+             "{\"dtc_count\":%u,\"codes\":[\"P0300\",\"P0171\"]}",
+             snapshot_status.dtc_count);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -324,23 +344,40 @@ static const httpd_uri_t uri_dtc = {
     .user_ctx = NULL,
 };
 
+// Handler start diagnostic menjadi Asynchronous agar tidak memblokir HTTP Server
 static esp_err_t start_diagnostic_handler(httpd_req_t *req)
 {
-    bool success = kwp2000_begin_diagnostic_session(0x81);
-    if (success) {
-        success = kwp2000_tester_present();
+    if (diagnostic_request_sem == NULL || diagnostic_state_mutex == NULL ||
+        xSemaphoreTake(diagnostic_state_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Diagnostic service unavailable");
+        return ESP_FAIL;
     }
 
-    if (success) {
-        ESP_LOGI(TAG, "K-Line diagnostic session started from dashboard");
-    } else {
-        ESP_LOGW(TAG, "K-Line diagnostic session failed from dashboard");
+    if (diagnostic_request_active) {
+        xSemaphoreGive(diagnostic_state_mutex);
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req,
+                           "{\"success\":false,\"message\":\"Diagnostic request already active\"}");
+        return ESP_OK;
     }
+
+    diagnostic_request_active = true;
+    BaseType_t request_queued = xSemaphoreGive(diagnostic_request_sem);
+    if (request_queued != pdTRUE) {
+        diagnostic_request_active = false;
+        xSemaphoreGive(diagnostic_state_mutex);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Failed to queue diagnostic request");
+        return ESP_FAIL;
+    }
+    xSemaphoreGive(diagnostic_state_mutex);
+
+    ESP_LOGI(TAG, "Diagnostic session initialization requested from Dashboard");
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, success
-        ? "{\"success\":true}"
-        : "{\"success\":false}");
+    httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"Init request sent\"}");
     return ESP_OK;
 }
 
@@ -354,7 +391,14 @@ static const httpd_uri_t uri_start_diagnostic = {
 static esp_err_t tx_test_handler(httpd_req_t *req)
 {
     const char *mode = static_cast<const char *>(req->user_ctx);
-    bool success = false;
+    if (kwp_mutex == NULL ||
+        xSemaphoreTake(kwp_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "KWP2000 lock busy");
+        return ESP_FAIL;
+    }
+
+    bool success;
     if (strcmp(mode, "high") == 0) {
         success = kwp2000_start_tx_hardware_test(false);
     } else if (strcmp(mode, "low") == 0) {
@@ -363,13 +407,14 @@ static esp_err_t tx_test_handler(httpd_req_t *req)
         kwp2000_stop_tx_hardware_test();
         success = true;
     }
+    xSemaphoreGive(kwp_mutex);
 
     httpd_resp_set_type(req, "application/json");
     if (success) {
         httpd_resp_sendstr(req, "{\"success\":true}");
     } else {
         httpd_resp_sendstr(req,
-                           "{\"success\":false,\"error\":\"TX test unavailable while UART or diagnostic session is active\"}");
+            "{\"success\":false,\"error\":\"TX test unavailable while UART or diagnostic session is active\"}");
     }
     return ESP_OK;
 }
@@ -395,64 +440,58 @@ static const httpd_uri_t uri_tx_test_stop = {
     .user_ctx = (void *)"stop",
 };
 
+// Log handler aman tanpa mematikan interrupt CPU
 static esp_err_t logs_json_handler(httpd_req_t *req)
 {
     char (*snapshot)[WEB_LOG_LINE_SIZE] =
-        static_cast<char (*)[WEB_LOG_LINE_SIZE]>(
-            malloc(WEB_LOG_LINE_COUNT * WEB_LOG_LINE_SIZE));
+        (char (*)[WEB_LOG_LINE_SIZE])malloc(sizeof(web_log_lines));
     if (snapshot == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "Log snapshot allocation failed");
+                            "Unable to allocate log snapshot");
         return ESP_FAIL;
     }
 
-    size_t snapshot_count;
-    size_t snapshot_first;
-    portENTER_CRITICAL(&web_log_lock);
-    snapshot_count = web_log_count;
-    snapshot_first = (web_log_next + WEB_LOG_LINE_COUNT - web_log_count)
-        % WEB_LOG_LINE_COUNT;
-    for (size_t i = 0; i < snapshot_count; i++) {
-        strncpy(snapshot[i],
-                web_log_lines[(snapshot_first + i) % WEB_LOG_LINE_COUNT],
-                WEB_LOG_LINE_SIZE - 1);
-        snapshot[i][WEB_LOG_LINE_SIZE - 1] = '\0';
+    if (web_log_mutex == NULL || xSemaphoreTake(web_log_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        free(snapshot);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Log lock busy");
+        return ESP_FAIL;
     }
-    portEXIT_CRITICAL(&web_log_lock);
+
+    const size_t snapshot_count = web_log_count;
+    const size_t snapshot_first =
+        (web_log_next + WEB_LOG_LINE_COUNT - snapshot_count) % WEB_LOG_LINE_COUNT;
+    for (size_t i = 0; i < snapshot_count; i++) {
+        memcpy(snapshot[i], web_log_lines[(snapshot_first + i) % WEB_LOG_LINE_COUNT],
+               WEB_LOG_LINE_SIZE);
+    }
+    xSemaphoreGive(web_log_mutex);
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr_chunk(req, "{\"lines\":[");
-
-    for (size_t i = 0; i < snapshot_count; i++) {
+    esp_err_t err = httpd_resp_sendstr_chunk(req, "{\"lines\":[");
+    for (size_t i = 0; err == ESP_OK && i < snapshot_count; i++) {
         const char *line = snapshot[i];
         char escaped[WEB_LOG_LINE_SIZE * 2];
         size_t escaped_len = 0;
+
         for (size_t j = 0; line[j] != '\0' && escaped_len + 2 < sizeof(escaped); j++) {
             char c = line[j];
-            if (c == '\\' || c == '"') {
-                escaped[escaped_len++] = '\\';
-            } else if (c == '\n') {
-                escaped[escaped_len++] = '\\';
-                escaped[escaped_len++] = 'n';
-                continue;
-            } else if (c == '\r') {
-                continue;
-            }
+            if (c == '\\' || c == '"') escaped[escaped_len++] = '\\';
+            else if (c == '\n') { escaped[escaped_len++] = '\\'; escaped[escaped_len++] = 'n'; continue; }
+            else if (c == '\r') continue;
             escaped[escaped_len++] = c;
         }
         escaped[escaped_len] = '\0';
-        if (i > 0) {
-            httpd_resp_sendstr_chunk(req, ",");
-        }
-        httpd_resp_sendstr_chunk(req, "\"");
-        httpd_resp_sendstr_chunk(req, escaped);
-        httpd_resp_sendstr_chunk(req, "\"");
+
+        if (i > 0) err = httpd_resp_sendstr_chunk(req, ",");
+        if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, "\"");
+        if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, escaped);
+        if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, "\"");
     }
 
-    httpd_resp_sendstr_chunk(req, "]}");
-    httpd_resp_sendstr_chunk(req, NULL);
+    if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, "]}");
+    if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, NULL);
     free(snapshot);
-    return ESP_OK;
+    return err;
 }
 
 static const httpd_uri_t uri_logs = {
@@ -477,39 +516,14 @@ static const httpd_uri_t uri_clear_logs = {
     .user_ctx = NULL,
 };
 
-static void queue_consumer_task(void *arg)
-{
-    ecu_status_t status;
-
-    while (1) {
-        if (xQueueReceive(ecu_queue, &status, pdMS_TO_TICKS(200)) == pdTRUE) {
-            current_status = status;
-            current_status.sd_card_available = sd_logger_is_available();
-            sd_logger_log_ecu_status(status.timestamp_ms,
-                                     status.ecu_connected,
-                                     status.rpm,
-                                     status.speed_kph,
-                                     status.coolant_temp_c,
-                                     status.dtc_count);
-            ESP_LOGI(TAG, "Queued status: connected=%d rpm=%u speed=%u coolant=%u dtc=%u",
-                     status.ecu_connected,
-                     status.rpm,
-                     status.speed_kph,
-                     status.coolant_temp_c,
-                     status.dtc_count);
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
 static void wifi_init_softap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_ap();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&config));
 
     wifi_config_t wifi_config = {};
     memcpy(wifi_config.ap.ssid, WIFI_SSID, strlen(WIFI_SSID));
@@ -519,7 +533,6 @@ static void wifi_init_softap(void)
     wifi_config.ap.max_connection = 4;
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_config.ap.pmf_cfg.required = false;
-
     if (strlen(WIFI_PASS) == 0) {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
@@ -527,7 +540,6 @@ static void wifi_init_softap(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
     ESP_LOGI(TAG, "AP started: %s", WIFI_SSID);
 }
 
@@ -552,49 +564,105 @@ static void start_webserver(void)
     ESP_LOGI(TAG, "HTTP dashboard started on http://192.168.4.1");
 }
 
-// Task untuk test KWP2000 di core 0
+static void queue_consumer_task(void *arg)
+{
+    ecu_status_t status;
+    while (1) {
+        if (xQueueReceive(ecu_queue, &status, pdMS_TO_TICKS(200)) == pdTRUE) {
+            if (status_mutex && xSemaphoreTake(status_mutex, portMAX_DELAY) == pdTRUE) {
+                current_status = status;
+                current_status.sd_card_available = sd_logger_is_available();
+                xSemaphoreGive(status_mutex);
+            }
+
+            sd_logger_log_ecu_status(status.timestamp_ms,
+                                     status.ecu_connected,
+                                     status.rpm,
+                                     status.speed_kph,
+                                     status.coolant_temp_c,
+                                     status.dtc_count);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// Task KWP2000 terpusat (Mengelola Init & Sampling Data)
 void app_test_kwp2000(void *arg)
 {
     ESP_LOGI(TAG, "Test KWP2000 task started on core %d", xPortGetCoreID());
-
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     ecu_status_t status;
     memset(&status, 0, sizeof(status));
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        if (!kwp2000_is_initialized()) {
+        if (diagnostic_request_sem != NULL &&
+            xSemaphoreTake(diagnostic_request_sem, 0) == pdTRUE) {
+            ESP_LOGI(TAG, "Executing Fast Init requested from Web UI...");
+
+            if (kwp_mutex != NULL &&
+                xSemaphoreTake(kwp_mutex, portMAX_DELAY) == pdTRUE) {
+                bool success = kwp2000_begin_diagnostic_session(0x81);
+                if (success) {
+                    kwp2000_tester_present();
+                    ESP_LOGI(TAG, "K-Line Session Initialized Successfully");
+                } else {
+                    ESP_LOGW(TAG, "K-Line Fast Init Failed");
+                }
+                xSemaphoreGive(kwp_mutex);
+            } else {
+                ESP_LOGE(TAG, "Unable to acquire KWP2000 mutex for initialization");
+            }
+
+            if (diagnostic_state_mutex != NULL &&
+                xSemaphoreTake(diagnostic_state_mutex, portMAX_DELAY) == pdTRUE) {
+                diagnostic_request_active = false;
+                xSemaphoreGive(diagnostic_state_mutex);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (kwp_mutex == NULL ||
+            xSemaphoreTake(kwp_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
             continue;
         }
 
         uint8_t table_data[64];
         uint8_t table_len = sizeof(table_data);
-        if (kwp2000_read_data_by_id(0x10, table_data, &table_len)) {
+        bool read_ok = false;
+        bool session_initialized = kwp2000_is_initialized();
+        if (session_initialized) {
+            read_ok = kwp2000_read_data_by_id(0x10, table_data, &table_len);
+        }
+        xSemaphoreGive(kwp_mutex);
+
+        if (!session_initialized) {
+            continue;
+        }
+
+        if (read_ok) {
             if (table_len < 15) {
                 status.ecu_connected = false;
-                snprintf(status.status_text, sizeof(status.status_text),
-                         "invalid table 0x10");
+                snprintf(status.status_text, sizeof(status.status_text), "invalid table 0x10");
                 xQueueSend(ecu_queue, &status, portMAX_DELAY);
-                ESP_LOGW(TAG, "Honda Table 0x10 response is too short");
                 continue;
             }
 
             status.ecu_connected = true;
-            status.rpm = ((uint16_t)table_data[1] << 8) | table_data[2];
+            status.tps_percent_tenths = (uint16_t)table_data[5] * 5;
+            status.rpm = ((uint16_t)table_data[6] << 8) | table_data[7];
             status.speed_kph = table_data[14];
-            status.coolant_temp_c = table_data[6] - 40;
+            status.coolant_temp_c = (int16_t)table_data[8] - 40;
+            status.map_kpa_quarters = (uint16_t)table_data[11] * 3;
             status.dtc_count = 0;
             snprintf(status.status_text, sizeof(status.status_text), "ecu ok");
             status.timestamp_ms = esp_timer_get_time() / 1000ULL;
             xQueueSend(ecu_queue, &status, portMAX_DELAY);
-            ESP_LOGI(TAG, "Honda Table 0x10 OK: rpm=%u speed=%u coolant=%u",
-                     status.rpm, status.speed_kph, status.coolant_temp_c);
         } else {
             status.ecu_connected = false;
             snprintf(status.status_text, sizeof(status.status_text), "waiting");
             xQueueSend(ecu_queue, &status, portMAX_DELAY);
-            ESP_LOGW(TAG, "Keep-alive failed");
         }
     }
 }
@@ -608,6 +676,18 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    // Buat Mutex
+    web_log_mutex = xSemaphoreCreateMutex();
+    status_mutex = xSemaphoreCreateMutex();
+    kwp_mutex = xSemaphoreCreateMutex();
+    diagnostic_request_sem = xSemaphoreCreateBinary();
+    diagnostic_state_mutex = xSemaphoreCreateMutex();
+    if (web_log_mutex == NULL || status_mutex == NULL || kwp_mutex == NULL ||
+        diagnostic_request_sem == NULL || diagnostic_state_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create application synchronization primitives");
+        return;
+    }
+
     web_log_previous_vprintf = esp_log_set_vprintf(web_log_vprintf);
     ESP_LOGI(TAG, "Starting TinyML Classificator with KWP2000 + Dashboard");
 
@@ -618,25 +698,24 @@ extern "C" void app_main(void)
     }
 
     bool sd_ready = sd_logger_init();
-    current_status.sd_card_available = sd_ready;
-    if (!sd_ready) {
-        ESP_LOGW(TAG, "SD logger unavailable; continuing without SD logging");
+    if (xSemaphoreTake(status_mutex, portMAX_DELAY) == pdTRUE) {
+        current_status.sd_card_available = sd_ready;
+        xSemaphoreGive(status_mutex);
+    }
+
+    kwp2000_init(KLINE_RX_GPIO, KLINE_TX_GPIO, KLINE_BAUDRATE);
+    BaseType_t queue_task_result = xTaskCreatePinnedToCore(
+        queue_consumer_task, "queue_consumer", 4096, NULL, 5, NULL, 1);
+    BaseType_t kwp_task_result = xTaskCreatePinnedToCore(
+        app_test_kwp2000, "test_kwp2000", 4096, NULL, 5, NULL, 1);
+    if (queue_task_result != pdPASS || kwp_task_result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create application task(s): queue=%d KWP=%d",
+                 (int)queue_task_result, (int)kwp_task_result);
+        return;
     }
 
     wifi_init_softap();
     start_webserver();
 
-    xTaskCreatePinnedToCore(queue_consumer_task, "queue_consumer", 4096, NULL, 5, NULL, 0);
-
-    xTaskCreatePinnedToCore(
-        app_test_kwp2000,
-        "test_kwp2000",
-        4096,
-        NULL,
-        5,
-        NULL,
-        0);
-
     ESP_LOGI(TAG, "Application initialized");
 }
-  
