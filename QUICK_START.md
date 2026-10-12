@@ -166,7 +166,8 @@ bool kwp2000_receive_frame(kwp2000_frame_t *frame, uint32_t timeout_ms);
 
 // High-level operations
 bool kwp2000_tester_present(void);
-bool kwp2000_read_data_by_id(uint16_t data_id, uint8_t *response, uint8_t *response_len);
+bool kwp2000_read_data_by_id(uint16_t data_id, uint8_t *response,
+                             size_t response_capacity, uint8_t *response_len);
 bool kwp2000_write_data_by_id(uint16_t data_id, uint8_t *data, uint8_t data_len);
 bool kwp2000_read_dtc(uint8_t *dtc_buffer, uint8_t *dtc_count);
 bool kwp2000_clear_dtc(void);
@@ -182,7 +183,7 @@ QueueHandle_t kwp2000_get_response_queue(void);
    ```c
    uint8_t response[10];
    uint8_t response_len;
-   if (kwp2000_read_data_by_id(0x0001, response, &response_len)) {
+   if (kwp2000_read_data_by_id(0x0001, response, sizeof(response), &response_len)) {
        uint16_t rpm = (response[0] << 8) | response[1];
        printf("RPM: %d\n", rpm * 25);  // Honda: value * 25
    }

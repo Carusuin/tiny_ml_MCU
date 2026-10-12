@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
@@ -10,23 +11,18 @@
 extern "C" {
 #endif
 
+// Set 1 jika memakai transistor NPN inverting (TX HIGH -> Bus LOW),
+// Set 0 jika memakai L9637D / IC Transceiver non-inverting.
+#define KLINE_HW_INVERTING 1
+
 #define KWP_FRAME_MAX_SIZE 256
+#define KWP_RX_HISTORY_SIZE 1024
 
-// KWP2000 Service IDs
-#define KWP_START_DIAGNOSTIC           0x10
-#define KWP_ECU_RESET                  0x11
-#define KWP_READ_DTC                   0x18
-#define KWP_READ_DATA_BY_ID            0x22
-#define KWP_WRITE_DATA_BY_ID           0x2E
-#define KWP_TESTER_PRESENT             0x3E
-#define KWP_READ_EXTENDED_DATA         0x19
-#define KWP_CLEAR_DTC                  0x14
+// Honda CB150R KWP2000 Addresses & Commands
+#define KWP_HONDA_DESTINATION          0x72
+#define KWP_HONDA_REQUEST_ALL          0x71
 
-// Honda CB150R specific addresses
-#define KWP_HONDA_ECU_ADDRESS          0x11
-#define KWP_TOOL_ADDRESS               0xF1
-
-// KWP2000 Frame structure
+// Frame structure
 typedef struct {
     uint8_t length;
     uint8_t target_address;
@@ -44,46 +40,39 @@ typedef struct {
     bool is_valid;
 } kwp2000_message_t;
 
-// Initialize KWP2000 UART and task
+// Inisialisasi awal port & driver K-Line
 void kwp2000_init(int rx_gpio, int tx_gpio, int baudrate);
 
-// Send the K-Line fast-initialization wake-up pattern before UART traffic.
+// Eksekusi Fast Init Bit-Bang (25ms LOW / 25ms HIGH)
 bool kwp2000_fast_init(void);
 
-// Force the TX logic level for hardware testing. The UART must be idle.
-bool kwp2000_start_tx_hardware_test(bool force_low);
+// Pengujian hardware fisik Bus LOW / Bus HIGH
+bool kwp2000_start_tx_hardware_test(bool force_bus_low);
 void kwp2000_stop_tx_hardware_test(void);
 
-// Run Fast Init, start UART communication, and open a diagnostic session.
+// Mulai sesi diagnostik Honda K-Line
 bool kwp2000_begin_diagnostic_session(uint8_t session_type);
+
+// Reset status sesi diagnostik
+void kwp2000_reset_session(void);
 
 bool kwp2000_is_initialized(void);
 
-// Send KWP2000 frame
+// Transmisi & penerimaan frame
 bool kwp2000_send_frame(kwp2000_frame_t *frame);
-
-// Receive KWP2000 frame
 bool kwp2000_receive_frame(kwp2000_frame_t *frame, uint32_t timeout_ms);
 
-// Tester Present (keep-alive)
-bool kwp2000_tester_present(void);
+// Read Data By ID (Honda Live Data Table)
+bool kwp2000_read_data_by_id(uint16_t data_id,
+                             uint8_t *response,
+                             size_t response_capacity,
+                             uint8_t *response_len);
 
-// Read Data By ID
-bool kwp2000_read_data_by_id(uint16_t data_id, uint8_t *response, uint8_t *response_len);
+size_t kwp2000_copy_rx_history(uint8_t *buffer,
+                               size_t capacity,
+                               uint32_t *dropped_bytes);
+void kwp2000_clear_rx_history(void);
 
-// Write Data By ID
-bool kwp2000_write_data_by_id(uint16_t data_id, uint8_t *data, uint8_t data_len);
-
-// Read DTC (Diagnostic Trouble Codes)
-bool kwp2000_read_dtc(uint8_t *dtc_buffer, uint8_t *dtc_count);
-
-// Clear DTC
-bool kwp2000_clear_dtc(void);
-
-// Start diagnostic session
-bool kwp2000_start_diagnostic_session(uint8_t session_type);
-
-// Get KWP2000 response queue
 QueueHandle_t kwp2000_get_response_queue(void);
 
 #ifdef __cplusplus

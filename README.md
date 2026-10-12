@@ -233,7 +233,8 @@ bool kwp2000_receive_frame(kwp2000_frame_t *frame, uint32_t timeout_ms);
 bool kwp2000_tester_present(void);
 
 // Read sensor data
-bool kwp2000_read_data_by_id(uint16_t data_id, uint8_t *response, uint8_t *response_len);
+bool kwp2000_read_data_by_id(uint16_t data_id, uint8_t *response,
+                             size_t response_capacity, uint8_t *response_len);
 
 // Write parameter
 bool kwp2000_write_data_by_id(uint16_t data_id, uint8_t *data, uint8_t data_len);

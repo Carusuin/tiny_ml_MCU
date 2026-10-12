@@ -176,6 +176,16 @@ static const char *dashboard_html = R"html(
     </div>
     <pre id="serialLog" style="background:#030712;color:#d1d5db;padding:12px;max-height:360px;overflow:auto;white-space:pre-wrap;font-size:12px;"></pre>
   </div>
+  <div class="card" style="margin-top:20px;">
+    <div class="row">
+      <div>
+        <div class="label">Raw UART RX Bytes (hex)</div>
+        <div id="rxByteInfo" style="margin-top:8px;color:#9ca3af;">Waiting for RX data...</div>
+      </div>
+      <button onclick="clearRxBytes()">Clear RX</button>
+    </div>
+    <pre id="rxBytes" style="background:#030712;color:#d1d5db;padding:12px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:12px;"></pre>
+  </div>
   <script>
     async function loadStatus() {
       try {
@@ -244,6 +254,25 @@ static const char *dashboard_html = R"html(
       await fetch('/api/logs/clear', { method: 'POST' });
       await loadLogs();
     }
+    async function loadRxBytes() {
+      try {
+        const response = await fetch('/api/rx-bytes');
+        const data = await response.json();
+        const output = document.getElementById('rxBytes');
+        const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 8;
+        output.textContent = data.bytes || 'No RX bytes captured';
+        if (atBottom) output.scrollTop = output.scrollHeight;
+        document.getElementById('rxByteInfo').textContent =
+          data.retained + ' bytes retained' +
+          (data.dropped ? ' · ' + data.dropped + ' older bytes overwritten' : '');
+      } catch (error) {
+        document.getElementById('rxByteInfo').textContent = 'Unable to fetch RX bytes';
+      }
+    }
+    async function clearRxBytes() {
+      await fetch('/api/rx-bytes/clear', { method: 'POST' });
+      await loadRxBytes();
+    }
     async function setTxTest(level) {
       const response = await fetch('/api/tx-test/' + level, { method: 'POST' });
       const data = await response.json();
@@ -256,10 +285,11 @@ static const char *dashboard_html = R"html(
       document.getElementById('txTestMessage').textContent =
         data.success ? 'TX released' : data.error;
     }
-    loadStatus(); loadDtc(); loadLogs();
+    loadStatus(); loadDtc(); loadLogs(); loadRxBytes();
     setInterval(loadStatus, 1000);
     setInterval(loadDtc, 3000);
     setInterval(loadLogs, 500);
+    setInterval(loadRxBytes, 500);
   </script>
 </body>
 </html>
@@ -330,7 +360,7 @@ static esp_err_t dtc_json_handler(httpd_req_t *req)
 
     char json[128];
     snprintf(json, sizeof(json),
-             "{\"dtc_count\":%u,\"codes\":[\"P0300\",\"P0171\"]}",
+             "{\"dtc_count\":%u,\"codes\":[]}",
              snapshot_status.dtc_count);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
@@ -443,16 +473,7 @@ static const httpd_uri_t uri_tx_test_stop = {
 // Log handler aman tanpa mematikan interrupt CPU
 static esp_err_t logs_json_handler(httpd_req_t *req)
 {
-    char (*snapshot)[WEB_LOG_LINE_SIZE] =
-        (char (*)[WEB_LOG_LINE_SIZE])malloc(sizeof(web_log_lines));
-    if (snapshot == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "Unable to allocate log snapshot");
-        return ESP_FAIL;
-    }
-
     if (web_log_mutex == NULL || xSemaphoreTake(web_log_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Log lock busy");
         return ESP_FAIL;
     }
@@ -460,16 +481,12 @@ static esp_err_t logs_json_handler(httpd_req_t *req)
     const size_t snapshot_count = web_log_count;
     const size_t snapshot_first =
         (web_log_next + WEB_LOG_LINE_COUNT - snapshot_count) % WEB_LOG_LINE_COUNT;
-    for (size_t i = 0; i < snapshot_count; i++) {
-        memcpy(snapshot[i], web_log_lines[(snapshot_first + i) % WEB_LOG_LINE_COUNT],
-               WEB_LOG_LINE_SIZE);
-    }
-    xSemaphoreGive(web_log_mutex);
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t err = httpd_resp_sendstr_chunk(req, "{\"lines\":[");
+
     for (size_t i = 0; err == ESP_OK && i < snapshot_count; i++) {
-        const char *line = snapshot[i];
+        const char *line = web_log_lines[(snapshot_first + i) % WEB_LOG_LINE_COUNT];
         char escaped[WEB_LOG_LINE_SIZE * 2];
         size_t escaped_len = 0;
 
@@ -488,9 +505,10 @@ static esp_err_t logs_json_handler(httpd_req_t *req)
         if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, "\"");
     }
 
+    xSemaphoreGive(web_log_mutex);
+
     if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, "]}");
     if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, NULL);
-    free(snapshot);
     return err;
 }
 
@@ -498,6 +516,70 @@ static const httpd_uri_t uri_logs = {
     .uri = "/api/logs",
     .method = HTTP_GET,
     .handler = logs_json_handler,
+    .user_ctx = NULL,
+};
+
+static esp_err_t rx_bytes_json_handler(httpd_req_t *req)
+{
+    static const char hex_digits[] = "0123456789ABCDEF";
+    uint8_t rx_bytes[KWP_RX_HISTORY_SIZE];
+    uint32_t dropped_bytes = 0;
+    size_t byte_count = kwp2000_copy_rx_history(
+        rx_bytes, sizeof(rx_bytes), &dropped_bytes);
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr_chunk(req, "{\"bytes\":\"");
+    for (size_t offset = 0; err == ESP_OK && offset < byte_count;) {
+        char chunk[24 * 3 + 1];
+        size_t chunk_length = 0;
+        size_t chunk_end = offset + 24;
+        if (chunk_end > byte_count) {
+            chunk_end = byte_count;
+        }
+
+        for (; offset < chunk_end; offset++) {
+            if (offset > 0) {
+                chunk[chunk_length++] = ' ';
+            }
+            chunk[chunk_length++] = hex_digits[rx_bytes[offset] >> 4];
+            chunk[chunk_length++] = hex_digits[rx_bytes[offset] & 0x0F];
+        }
+        chunk[chunk_length] = '\0';
+        err = httpd_resp_sendstr_chunk(req, chunk);
+    }
+
+    char metadata[80];
+    snprintf(metadata, sizeof(metadata),
+             "\",\"retained\":%u,\"dropped\":%lu}",
+             (unsigned)byte_count, (unsigned long)dropped_bytes);
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, metadata);
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, NULL);
+    }
+    return err;
+}
+
+static const httpd_uri_t uri_rx_bytes = {
+    .uri = "/api/rx-bytes",
+    .method = HTTP_GET,
+    .handler = rx_bytes_json_handler,
+    .user_ctx = NULL,
+};
+
+static esp_err_t clear_rx_bytes_handler(httpd_req_t *req)
+{
+    kwp2000_clear_rx_history();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"success\":true}");
+    return ESP_OK;
+}
+
+static const httpd_uri_t uri_clear_rx_bytes = {
+    .uri = "/api/rx-bytes/clear",
+    .method = HTTP_POST,
+    .handler = clear_rx_bytes_handler,
     .user_ctx = NULL,
 };
 
@@ -549,6 +631,7 @@ static void start_webserver(void)
     config.server_port = 80;
     config.max_open_sockets = 6;
     config.max_uri_handlers = 12;
+    config.stack_size = 8192;
 
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
@@ -561,6 +644,8 @@ static void start_webserver(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_tx_test_stop));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_logs));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_clear_logs));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_rx_bytes));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_clear_rx_bytes));
     ESP_LOGI(TAG, "HTTP dashboard started on http://192.168.4.1");
 }
 
@@ -604,7 +689,6 @@ void app_test_kwp2000(void *arg)
                 xSemaphoreTake(kwp_mutex, portMAX_DELAY) == pdTRUE) {
                 bool success = kwp2000_begin_diagnostic_session(0x81);
                 if (success) {
-                    kwp2000_tester_present();
                     ESP_LOGI(TAG, "K-Line Session Initialized Successfully");
                 } else {
                     ESP_LOGW(TAG, "K-Line Fast Init Failed");
@@ -621,49 +705,63 @@ void app_test_kwp2000(void *arg)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        if (kwp_mutex == NULL ||
-            xSemaphoreTake(kwp_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-            continue;
-        }
-
         uint8_t table_data[64];
-        uint8_t table_len = sizeof(table_data);
+        uint8_t table_len = 0;
         bool read_ok = false;
-        bool session_initialized = kwp2000_is_initialized();
-        if (session_initialized) {
-            read_ok = kwp2000_read_data_by_id(0x10, table_data, &table_len);
+        bool session_initialized = false;
+
+        if (kwp_mutex != NULL &&
+            xSemaphoreTake(kwp_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            session_initialized = kwp2000_is_initialized();
+            if (session_initialized) {
+                read_ok = kwp2000_read_data_by_id(
+                    0x10, table_data, sizeof(table_data), &table_len);
+            }
+            xSemaphoreGive(kwp_mutex);
         }
-        xSemaphoreGive(kwp_mutex);
 
         if (!session_initialized) {
+            vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
+        static int consecutive_failures = 0;
+
         if (read_ok) {
-            if (table_len < 15) {
+            if (table_len < 12) {
                 status.ecu_connected = false;
                 snprintf(status.status_text, sizeof(status.status_text), "invalid table 0x10");
                 xQueueSend(ecu_queue, &status, portMAX_DELAY);
+                vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
 
+            consecutive_failures = 0;
             status.ecu_connected = true;
-            status.tps_percent_tenths = (uint16_t)table_data[5] * 5;
-            status.rpm = ((uint16_t)table_data[6] << 8) | table_data[7];
-            status.speed_kph = table_data[14];
-            status.coolant_temp_c = (int16_t)table_data[8] - 40;
-            status.map_kpa_quarters = (uint16_t)table_data[11] * 3;
+            status.tps_percent_tenths = (uint16_t)table_data[2] * 5;
+            status.rpm = ((uint16_t)table_data[3] << 8) | table_data[4];
+            status.coolant_temp_c = (int16_t)table_data[5] - 40;
+            status.map_kpa_quarters = (uint16_t)table_data[8] * 3;
+            status.speed_kph = table_data[11];
             status.dtc_count = 0;
             snprintf(status.status_text, sizeof(status.status_text), "ecu ok");
             status.timestamp_ms = esp_timer_get_time() / 1000ULL;
             xQueueSend(ecu_queue, &status, portMAX_DELAY);
         } else {
+            consecutive_failures++;
+            if (consecutive_failures >= 10) {
+                if (kwp_mutex != NULL && xSemaphoreTake(kwp_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    kwp2000_reset_session();
+                    xSemaphoreGive(kwp_mutex);
+                }
+                consecutive_failures = 0;
+            }
             status.ecu_connected = false;
             snprintf(status.status_text, sizeof(status.status_text), "waiting");
             xQueueSend(ecu_queue, &status, portMAX_DELAY);
         }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 

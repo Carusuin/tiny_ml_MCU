@@ -26,7 +26,7 @@
   kwp2000_send_frame(frame)
   kwp2000_receive_frame(frame, timeout)
   kwp2000_tester_present()
-  kwp2000_read_data_by_id(id, response, len)
+  kwp2000_read_data_by_id(id, response, capacity, len)
   kwp2000_write_data_by_id(id, data, len)
   kwp2000_read_dtc(buffer, count)
   kwp2000_clear_dtc()

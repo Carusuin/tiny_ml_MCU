@@ -5,10 +5,29 @@ Ini adalah setup untuk test komunikasi KWP2000 antara ESP32 dan ECU emulator (Py
 
 ## Profil timing dan pemetaan sensor (uji AGY)
 
-Firmware saat ini memakai Fast Init LOW 25 ms + HIGH 25 ms, W4 0 ms, UART
-10400 baud 8N1 inverted, timeout respons 120 ms, dan jeda TX 1 ms di antara
-byte. ACK wake-up standar `0E 04 72 7C` tetap diterima; dua varian yang
-dilaporkan AGY (`0E 04 72` tanpa checksum dan `72 8C`) juga diterima untuk uji.
+Firmware saat ini memakai Fast Init LOW 25 ms + HIGH 25 ms, W4 10 ms, UART
+10400 baud 8N1 inverted, timeout respons 120 ms, dan TX tanpa jeda antar-byte
+yang dikonfigurasi. ACK wake-up standar `0E 04 72 7C` tetap diterima; dua varian yang
+dilaporkan AGY (`0E 04 72` tanpa checksum dan `72 8C`) belum diterima oleh
+parser saat ini. Parser RX berjalan per byte dan mempertahankan `0xFE` kedua
+jika ada beberapa `0xFE` berturut-turut, sehingga header wake-up berikutnya
+tetap dapat diselaraskan. Echo hanya dibuang jika seluruh frame cocok dengan TX.
+Dashboard kini menampilkan stream byte mentah yang dibaca dari UART RX pada
+panel **Raw UART RX Bytes (hex)**. Riwayat menyimpan hingga 1024 byte terakhir;
+counter menunjukkan berapa byte lama yang tertimpa. Gunakan **Clear RX** sebelum
+satu percobaan agar echo dan respons percobaan itu mudah dibedakan. Byte yang
+sudah berada di buffer driver sebelum buffer dibersihkan juga direkam. Byte yang
+hilang karena overflow hardware/UART tidak dapat dipulihkan oleh firmware.
+Serial Monitor menampilkan baris `TIMING` untuk durasi idle, pulsa LOW/HIGH,
+perpindahan Fast Init ke UART, W4, pengiriman wake-up, dan waktu pembacaan byte
+RX relatif terhadap awal percobaan. Timestamp RX menunjukkan saat task membaca
+byte dari driver UART, bukan waktu tepi sinyal yang diukur langsung pada bus.
+RX task dijeda saat persiapan dan Fast Init agar tidak berkompetisi membaca/
+mengosongkan UART. Selama pulsa, input periferal UART ditahan pada level idle
+logis agar transisi Fast Init pada bus tidak membentuk byte RX; pin RX fisik
+dipulihkan setelah pulsa selesai. W4 yang dilaporkan adalah waktu dari akhir
+pulsa HIGH sampai awal pengiriman wake-up. Firmware memberi peringatan jika
+waktu aktual melebihi 15 ms.
 Untuk tabel data ID `0x10`, pemetaan uji diterapkan langsung ke indeks response
 yang dikembalikan (byte ID berada di indeks 0):
 
