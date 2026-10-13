@@ -138,7 +138,8 @@ static void kwp_diagnostic_timing_stop(void)
 // Helper penggerak level bus K-Line sesuai skema hardware
 static inline void kline_drive(bool bus_low)
 {
-    gpio_set_level((gpio_num_t)kwp_tx_gpio, KLINE_HW_INVERTING ? (bus_low ? 1 : 0) : (bus_low ? 0 : 1));
+    gpio_set_level((gpio_num_t)kwp_tx_gpio,
+                   KLINE_TX_INVERTING ? (bus_low ? 1 : 0) : (bus_low ? 0 : 1));
 }
 
 static uint8_t kwp2000_calculate_checksum(uint8_t *data, uint8_t len)
@@ -505,11 +506,10 @@ static bool kwp_configure_uart(bool start_task)
 
         ESP_ERROR_CHECK(uart_param_config(KWP_UART_NUM, &uart_config));
 
-        if (KLINE_HW_INVERTING) {
-            ESP_ERROR_CHECK(uart_set_line_inverse(KWP_UART_NUM, UART_SIGNAL_TXD_INV | UART_SIGNAL_RXD_INV));
-        } else {
-            ESP_ERROR_CHECK(uart_set_line_inverse(KWP_UART_NUM, UART_SIGNAL_RXD_INV));
-        }
+        uint32_t inverse_mask = 0;
+        if (KLINE_TX_INVERTING) inverse_mask |= UART_SIGNAL_TXD_INV;
+        if (KLINE_RX_INVERTING) inverse_mask |= UART_SIGNAL_RXD_INV;
+        ESP_ERROR_CHECK(uart_set_line_inverse(KWP_UART_NUM, inverse_mask));
 
         ESP_ERROR_CHECK(uart_set_pin(KWP_UART_NUM, kwp_tx_gpio, kwp_rx_gpio,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -523,8 +523,9 @@ static bool kwp_configure_uart(bool start_task)
         kwp_capture_pending_rx(NULL, 0);
         ESP_ERROR_CHECK(uart_flush_input(KWP_UART_NUM));
 
-        ESP_LOGI(TAG, "UART initialized on RX=%d, TX=%d, Baud=%d, Invert=%d",
-                 kwp_rx_gpio, kwp_tx_gpio, kwp_baudrate, KLINE_HW_INVERTING);
+        ESP_LOGI(TAG, "UART initialized on RX=%d, TX=%d, Baud=%d, TX invert=%d RX invert=%d",
+                 kwp_rx_gpio, kwp_tx_gpio, kwp_baudrate,
+                 KLINE_TX_INVERTING, KLINE_RX_INVERTING);
     } else {
         ESP_ERROR_CHECK(uart_set_pin(KWP_UART_NUM, kwp_tx_gpio, kwp_rx_gpio,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -610,7 +611,8 @@ bool kwp2000_start_tx_hardware_test(bool force_bus_low)
 
     gpio_reset_pin((gpio_num_t)kwp_tx_gpio);
     gpio_set_direction((gpio_num_t)kwp_tx_gpio, GPIO_MODE_OUTPUT);
-    gpio_set_pull_mode((gpio_num_t)kwp_tx_gpio, GPIO_PULLDOWN_ONLY);
+    gpio_set_pull_mode((gpio_num_t)kwp_tx_gpio,
+                       KLINE_TX_INVERTING ? GPIO_PULLDOWN_ONLY : GPIO_PULLUP_ONLY);
 
     kline_drive(force_bus_low);
 

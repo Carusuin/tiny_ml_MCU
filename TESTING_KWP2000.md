@@ -17,7 +17,9 @@ parameter. Baud aktual dibaca, dicatat, dan Fast Init dibatalkan jika selisih
 target melebihi 2%; setelah pulsa UART kembali ke 10400 baud. W4 tambahan
 default 0 us karena fase HIGH sudah dilaksanakan di Fast Init; wake-up
 `FE 04 72 8C` dikirim setelah pembersihan RX.
-UART tetap 8N1 inverted dan TX tidak dipetakan ulang selama urutan init. Timeout
+UART tetap 8N1 dengan `KLINE_TX_INVERTING=1` dan `KLINE_RX_INVERTING=1` untuk
+rangkaian NPN inverting saat ini; TX tidak dipetakan ulang selama urutan init.
+Timeout
 respons 120 ms dan TX tanpa jeda antar-byte yang dikonfigurasi. ACK wake-up
 harus memiliki target `0x0E` atau `0x02`, panjang 4, dan checksum valid. ACK
 sesi harus memiliki panjang 5, service `0x71`, dan data pertama `0x00`. Dua

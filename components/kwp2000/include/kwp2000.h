@@ -11,9 +11,9 @@
 extern "C" {
 #endif
 
-// Set 1 jika memakai transistor NPN inverting (TX HIGH -> Bus LOW),
-// Set 0 jika memakai L9637D / IC Transceiver non-inverting.
-#define KLINE_HW_INVERTING 1
+// Set per jalur sesuai rangkaian inverter K-Line yang digunakan.
+#define KLINE_TX_INVERTING 1
+#define KLINE_RX_INVERTING 1
 
 #define KWP_FRAME_MAX_SIZE 256
 #define KWP_RX_HISTORY_SIZE 1024
