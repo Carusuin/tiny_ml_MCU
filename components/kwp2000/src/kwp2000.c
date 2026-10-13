@@ -67,6 +67,12 @@ static int64_t kwp_fast_init_low_us = 0;
 static int64_t kwp_fast_init_high_us = 0;
 static int64_t kwp_fast_init_high_end_us = 0;
 
+typedef struct {
+    size_t byte_count;
+    size_t echo_count;
+    size_t non_echo_count;
+} kwp_rx_exchange_summary_t;
+
 static bool kwp_pause_rx_task(void)
 {
     if (kwp_task_handle == NULL) {
@@ -278,11 +284,12 @@ static void kwp_log_pending_rx_and_flush(const char *phase)
     ESP_ERROR_CHECK(uart_flush_input(KWP_UART_NUM));
 }
 
-static void kwp_log_rx_exchange_summary(const uint8_t *tx,
-                                        size_t tx_length,
-                                        int64_t start_us,
-                                        int64_t end_us)
+static kwp_rx_exchange_summary_t kwp_log_rx_exchange_summary(const uint8_t *tx,
+                                                            size_t tx_length,
+                                                            int64_t start_us,
+                                                            int64_t end_us)
 {
+    kwp_rx_exchange_summary_t summary = {0};
     size_t event_count;
 
     portENTER_CRITICAL(&kwp_rx_event_lock);
@@ -337,6 +344,9 @@ static void kwp_log_rx_exchange_summary(const uint8_t *tx,
         non_echo_count++;
     }
     non_echo[non_echo_length] = '\0';
+    summary.byte_count = exchange_count;
+    summary.echo_count = echo_count;
+    summary.non_echo_count = non_echo_count;
     ESP_LOGI(TAG, "RX exchange summary: bytes=%u echo=%u non-echo=%u [%s]",
              (unsigned)exchange_count, (unsigned)echo_count,
              (unsigned)non_echo_count, non_echo);
@@ -362,6 +372,56 @@ static void kwp_log_rx_exchange_summary(const uint8_t *tx,
         ESP_LOGI(TAG, "RX inter-byte intervals us [%u-%u]: %s",
                  (unsigned)base, (unsigned)(stop - 1), intervals);
     }
+    return summary;
+}
+
+static bool kwp_frame_checksum_valid(const kwp2000_frame_t *frame)
+{
+    if (frame == NULL || frame->length < 4 ||
+        frame->data_len != frame->length - 4) {
+        return false;
+    }
+
+    uint8_t bytes[KWP_FRAME_MAX_SIZE];
+    bytes[0] = frame->target_address;
+    bytes[1] = frame->length;
+    bytes[2] = frame->service_id;
+    memcpy(&bytes[3], frame->data, frame->data_len);
+    bytes[frame->length - 1] = frame->checksum;
+    return kwp2000_calculate_checksum(bytes, frame->length - 1) ==
+           frame->checksum;
+}
+
+static void kwp_log_received_frame(const char *stage,
+                                   const kwp2000_frame_t *frame)
+{
+    if (frame == NULL || frame->length < 4 ||
+        frame->data_len != frame->length - 4) {
+        ESP_LOGW(TAG, "%s response frame could not be reconstructed", stage);
+        return;
+    }
+
+    char bytes[3 * KWP_FRAME_MAX_SIZE + 1];
+    size_t offset = 0;
+    int written = snprintf(bytes, sizeof(bytes), "%02X %02X %02X",
+                           frame->target_address, frame->length,
+                           frame->service_id);
+    if (written < 0 || (size_t)written >= sizeof(bytes)) {
+        return;
+    }
+    offset = (size_t)written;
+    for (size_t i = 0; i < frame->data_len; i++) {
+        written = snprintf(bytes + offset, sizeof(bytes) - offset,
+                           " %02X", frame->data[i]);
+        if (written < 0 || (size_t)written >= sizeof(bytes) - offset) {
+            return;
+        }
+        offset += (size_t)written;
+    }
+    snprintf(bytes + offset, sizeof(bytes) - offset, " %02X", frame->checksum);
+    ESP_LOGW(TAG, "%s received frame: %s (length=%u service=0x%02X checksum=%s)",
+             stage, bytes, frame->length, frame->service_id,
+             kwp_frame_checksum_valid(frame) ? "valid" : "invalid");
 }
 
 size_t kwp2000_copy_rx_history(uint8_t *buffer,
@@ -993,14 +1053,29 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type,
     int64_t wakeup_wait_start_us = esp_timer_get_time();
     bool wakeup_ack = kwp2000_receive_frame(&wakeup_response, KWP_WAKEUP_RESPONSE_TIMEOUT_MS);
     int64_t wakeup_wait_end_us = esp_timer_get_time();
-    kwp_log_rx_exchange_summary(wakeup_frame, sizeof(wakeup_frame),
-                                wakeup_tx_start_us, wakeup_wait_end_us);
+    kwp_rx_exchange_summary_t wakeup_rx_summary =
+        kwp_log_rx_exchange_summary(wakeup_frame, sizeof(wakeup_frame),
+                                    wakeup_tx_start_us, wakeup_wait_end_us);
     ESP_LOGI(TAG, "TIMING wake-up response wait=%lld us, result=%s",
              (long long)(wakeup_wait_end_us - wakeup_wait_start_us),
              wakeup_ack ? "frame received" : "timeout");
 
-    if (!wakeup_ack || (wakeup_response.target_address != 0x0E && wakeup_response.target_address != 0x02)) {
-        ESP_LOGW(TAG, "No valid Honda wake-up ACK received");
+    if (!wakeup_ack) {
+        ESP_LOGW(TAG,
+                 "Wake-up timeout: echo OK (%u byte), byte non-echo dalam 300 ms: %u",
+                 (unsigned)wakeup_rx_summary.echo_count,
+                 (unsigned)wakeup_rx_summary.non_echo_count);
+        kwp_diagnostic_timing_stop();
+        return false;
+    }
+
+    bool wakeup_ack_valid =
+        (wakeup_response.target_address == 0x0E ||
+         wakeup_response.target_address == 0x02) &&
+        wakeup_response.length == 4 &&
+        kwp_frame_checksum_valid(&wakeup_response);
+    if (!wakeup_ack_valid) {
+        kwp_log_received_frame("Invalid wake-up ACK", &wakeup_response);
         kwp_diagnostic_timing_stop();
         return false;
     }
@@ -1020,7 +1095,16 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type,
     kwp_log_rx_exchange_summary(init_frame, sizeof(init_frame),
                                 session_tx_start_us, esp_timer_get_time());
 
-    if (session_ack && (session_response.target_address == 0x0E || session_response.target_address == 0x02)) {
+    bool session_ack_valid =
+        session_ack &&
+        (session_response.target_address == 0x0E ||
+         session_response.target_address == 0x02) &&
+        session_response.length == 5 &&
+        session_response.service_id == 0x71 &&
+        session_response.data_len >= 1 &&
+        session_response.data[0] == 0x00 &&
+        kwp_frame_checksum_valid(&session_response);
+    if (session_ack_valid) {
         kwp_session_established = true;
         ESP_LOGI(TAG, "K-Line Diagnostic Session Established Successfully!");
         ESP_LOGI(TAG, "TIMING diagnostic sequence completed at +%lld us",
@@ -1029,6 +1113,11 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type,
         return true;
     }
 
+    if (session_ack) {
+        kwp_log_received_frame("Invalid session ACK", &session_response);
+    } else {
+        ESP_LOGW(TAG, "No valid session ACK frame; raw RX bytes are shown in the exchange summary above");
+    }
     ESP_LOGW(TAG, "TIMING session response missing/invalid at +%lld us",
              (long long)kwp_diagnostic_elapsed_us());
     kwp_diagnostic_timing_stop();

@@ -19,8 +19,10 @@ default 0 us karena fase HIGH sudah dilaksanakan di Fast Init; wake-up
 `FE 04 72 8C` dikirim setelah pembersihan RX.
 UART tetap 8N1 inverted dan TX tidak dipetakan ulang selama urutan init. Timeout
 respons 120 ms dan TX tanpa jeda antar-byte yang dikonfigurasi. ACK wake-up
-standar `0E 04 72 7C` tetap diterima; dua varian yang dilaporkan AGY
-(`0E 04 72` tanpa checksum dan `72 8C`) belum diterima oleh parser saat ini.
+harus memiliki target `0x0E` atau `0x02`, panjang 4, dan checksum valid. ACK
+sesi harus memiliki panjang 5, service `0x71`, dan data pertama `0x00`. Dua
+varian yang dilaporkan AGY (`0E 04 72` tanpa checksum dan `72 8C`) belum
+diterima oleh parser saat ini.
 Parser RX berjalan per byte dan mempertahankan `0xFE` kedua jika ada beberapa
 `0xFE` berturut-turut, sehingga header wake-up berikutnya tetap dapat
 diselaraskan. Echo hanya dibuang jika seluruh frame cocok dengan TX.
@@ -40,9 +42,12 @@ sinyal yang diukur langsung pada bus. RX task dijeda selama Fast Init tanpa
 mengalihkan pin RX UART. Setelah pulsa, firmware mencatat jumlah byte yang
 tertahan, membaca dan merekam byte ke Raw RX, menampilkan nilainya di log, lalu
 melakukan flush sebelum wake-up agar byte init tidak diproses sebagai respons.
-Jika buffer kosong, log menyatakan tidak ada byte yang diterima driver. W4 yang
-dilaporkan adalah waktu dari akhir pulsa HIGH sampai awal pengiriman wake-up;
-nilai aktual mencakup pencatatan dan pembersihan RX.
+Jika buffer kosong, log menyatakan tidak ada byte yang diterima driver. Setelah
+tiap jendela respons, firmware melaporkan jumlah byte, kecocokan echo TX, byte
+non-echo, dan selang antar-byte. Timeout wake-up mencatat jumlah echo dan
+non-echo; frame yang gagal validasi ditampilkan dalam log. W4 yang dilaporkan
+adalah waktu dari akhir pulsa HIGH sampai awal pengiriman wake-up; nilai aktual
+mencakup pencatatan dan pembersihan RX.
 Untuk tabel data ID `0x10`, pemetaan uji diterapkan langsung ke indeks response
 yang dikembalikan (byte ID berada di indeks 0):
 
