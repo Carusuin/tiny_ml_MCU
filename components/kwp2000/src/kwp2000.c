@@ -20,11 +20,6 @@ static const char *TAG = "KWP2000";
 #define KWP_RESPONSE_TIMEOUT_MS 120
 #define KWP_WAKEUP_RESPONSE_TIMEOUT_MS 300
 
-#define KWP_FAST_INIT_LOW_US    25000
-#define KWP_FAST_INIT_HIGH_US   25000
-#define KWP_FAST_INIT_W4_US     0
-#define KWP_FAST_INIT_IDLE_MS   3000
-
 #define KWP_FAST_INIT_RETRY_DELAY_US 2000000
 #define KWP_POST_WAKEUP_READ_DELAY_MS 50
 #define KWP_HARDWARE_TEST_TIMEOUT_US (45LL * 1000000LL)
@@ -35,6 +30,7 @@ static SemaphoreHandle_t kwp_rx_resume_sem = NULL;
 static int kwp_rx_gpio = 16;
 static int kwp_tx_gpio = 17;
 static int kwp_baudrate = 10400;
+static uint32_t kwp_byte_gap_us = 0;
 
 static bool kwp_uart_installed = false;
 static bool kwp_session_established = false;
@@ -492,6 +488,22 @@ static bool kwp_uart_write_frame(const uint8_t *buffer, int frame_len)
     if (buffer == NULL || frame_len <= 0) return false;
 
     int64_t tx_start_us = esp_timer_get_time();
+    if (kwp_byte_gap_us > 0) {
+        for (int i = 0; i < frame_len; i++) {
+            if (uart_write_bytes(KWP_UART_NUM, (const char *)&buffer[i], 1) != 1) {
+                ESP_LOGE(TAG, "UART write failed at frame byte %d", i);
+                return false;
+            }
+            if (uart_wait_tx_done(KWP_UART_NUM,
+                                  pdMS_TO_TICKS(KWP_TX_TIMEOUT_MS)) != ESP_OK) {
+                ESP_LOGE(TAG, "UART TX timed out at frame byte %d", i);
+                return false;
+            }
+            esp_rom_delay_us(kwp_byte_gap_us);
+        }
+        return true;
+    }
+
     if (uart_write_bytes(KWP_UART_NUM, (const char *)buffer, frame_len) != frame_len) {
         ESP_LOGE(TAG, "UART write failed");
         return false;
@@ -765,19 +777,29 @@ void kwp2000_init(int rx_gpio, int tx_gpio, int baudrate)
     kwp_configure_uart(true);
 }
 
-bool kwp2000_fast_init(void)
+static bool kwp_init_params_valid(const kwp_init_params_t *params)
+{
+    return params != NULL &&
+           params->low_ms >= 10 && params->low_ms <= 110 &&
+           params->high_ms >= 10 && params->high_ms <= 200 &&
+           params->w4_us <= 50000 &&
+           params->byte_gap_us <= 5000 &&
+           params->idle_ms >= 300 && params->idle_ms <= 5000;
+}
+
+bool kwp2000_fast_init(const kwp_init_params_t *params)
 {
     if (!kwp_uart_installed) {
         ESP_LOGE(TAG, "Cannot run UART Fast Init before UART is installed");
         return false;
     }
-    if (KWP_FAST_INIT_LOW_US <= 0) {
-        ESP_LOGE(TAG, "Fast Init LOW duration must be positive");
+    if (!kwp_init_params_valid(params)) {
+        ESP_LOGE(TAG, "Invalid Fast Init timing parameters");
         return false;
     }
 
     int64_t idle_start_us = esp_timer_get_time();
-    vTaskDelay(pdMS_TO_TICKS(KWP_FAST_INIT_IDLE_MS));
+    vTaskDelay(pdMS_TO_TICKS(params->idle_ms));
     int64_t idle_end_us = esp_timer_get_time();
 
     if (uart_wait_tx_done(KWP_UART_NUM, pdMS_TO_TICKS(100)) != ESP_OK) {
@@ -785,9 +807,8 @@ bool kwp2000_fast_init(void)
         return false;
     }
 
-    uint32_t slow_baud =
-        (uint32_t)((9ULL * 1000000ULL + KWP_FAST_INIT_LOW_US / 2) /
-                   KWP_FAST_INIT_LOW_US);
+    uint32_t low_us = params->low_ms * 1000U;
+    uint32_t slow_baud = (uint32_t)((9000000ULL + low_us / 2U) / low_us);
     uint32_t stop_bit_us = (1000000U + slow_baud - 1U) / slow_baud;
     esp_err_t err = uart_set_baudrate(KWP_UART_NUM, (int)slow_baud);
     if (err != ESP_OK) {
@@ -813,6 +834,19 @@ bool kwp2000_fast_init(void)
     stop_bit_us = (1000000U + actual_baud - 1U) / actual_baud;
     ESP_LOGI(TAG, "Fast Init baud target=%u actual=%u",
              (unsigned)slow_baud, (unsigned)actual_baud);
+    uint32_t baud_difference = actual_baud > slow_baud
+                                   ? actual_baud - slow_baud
+                                   : slow_baud - actual_baud;
+    if ((uint64_t)baud_difference * 100U > (uint64_t)slow_baud * 2U) {
+        ESP_LOGE(TAG, "Fast Init baud error exceeds 2%% (target=%u actual=%u)",
+                 (unsigned)slow_baud, (unsigned)actual_baud);
+        esp_err_t restore_err = uart_set_baudrate(KWP_UART_NUM, kwp_baudrate);
+        if (restore_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restore UART baud rate after Fast Init baud error: %s",
+                     esp_err_to_name(restore_err));
+        }
+        return false;
+    }
 
     const uint8_t low_pulse_frame = 0x00;
     int written = uart_write_bytes(KWP_UART_NUM,
@@ -843,8 +877,9 @@ bool kwp2000_fast_init(void)
         (9LL * 1000000LL + actual_baud - 1U) / actual_baud;
     int64_t high_start_us = frame_done_us - stop_bit_us;
     int64_t high_elapsed_us = stop_bit_us;
-    if (high_elapsed_us < KWP_FAST_INIT_HIGH_US) {
-        esp_rom_delay_us((uint32_t)(KWP_FAST_INIT_HIGH_US - high_elapsed_us));
+    uint32_t high_us = params->high_ms * 1000U;
+    if (high_elapsed_us < high_us) {
+        esp_rom_delay_us((uint32_t)(high_us - high_elapsed_us));
     }
     int64_t high_end_us = esp_timer_get_time();
 
@@ -869,9 +904,22 @@ bool kwp2000_fast_init(void)
     return true;
 }
 
-bool kwp2000_begin_diagnostic_session(uint8_t session_type)
+bool kwp2000_begin_diagnostic_session(uint8_t session_type,
+                                      const kwp_init_params_t *params)
 {
     (void)session_type;
+    if (!kwp_init_params_valid(params)) {
+        ESP_LOGE(TAG, "Invalid diagnostic initialization timing parameters");
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+             "Diagnostic timing: idle=%u ms low=%u ms high=%u ms W4=%u us byte-gap=%u us",
+             (unsigned)params->idle_ms,
+             (unsigned)params->low_ms,
+             (unsigned)params->high_ms,
+             (unsigned)params->w4_us,
+             (unsigned)params->byte_gap_us);
     ESP_LOGI(TAG, "Starting Honda K-Line Fast Init & Diagnostic Sequence");
     int64_t diagnostic_start_us = kwp_diagnostic_timing_start();
     ESP_LOGI(TAG, "TIMING +0 us diagnostic sequence started");
@@ -891,7 +939,8 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type)
         xQueueReset(kwp_response_queue);
     }
 
-    if (!kwp2000_fast_init()) {
+    kwp_byte_gap_us = params->byte_gap_us;
+    if (!kwp2000_fast_init(params)) {
         kwp_log_pending_rx_and_flush("Fast Init failure");
         kwp_resume_rx_task();
         kwp_diagnostic_timing_stop();
@@ -902,7 +951,7 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type)
     int64_t rx_cleanup_us = esp_timer_get_time();
 
     int64_t w4_elapsed_us = rx_cleanup_us - kwp_fast_init_high_end_us;
-    int64_t w4_remaining_us = KWP_FAST_INIT_W4_US - w4_elapsed_us;
+    int64_t w4_remaining_us = (int64_t)params->w4_us - w4_elapsed_us;
     if (w4_remaining_us > 0) {
         esp_rom_delay_us((uint32_t)w4_remaining_us);
     }
@@ -922,7 +971,7 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type)
              (long long)(rx_cleanup_us - kwp_fast_init_high_end_us));
     ESP_LOGI(TAG,
              "TIMING W4 configured=%d us, HIGH-end->TX=%lld us, RX-cleanup->TX=%lld us, TX+drain=%lld us",
-             KWP_FAST_INIT_W4_US,
+             (int)params->w4_us,
              (long long)actual_w4_us,
              (long long)(wakeup_tx_start_us - rx_cleanup_us),
              (long long)(wakeup_tx_done_us - wakeup_tx_start_us));

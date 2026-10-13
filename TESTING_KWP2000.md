@@ -6,11 +6,17 @@ Ini adalah setup untuk test komunikasi KWP2000 antara ESP32 dan ECU emulator (Py
 ## Profil timing dan pemetaan sensor (uji AGY)
 
 Firmware saat ini menghasilkan Fast Init dengan UART tetap tersambung ke TX:
-baud sementara dihitung dari durasi LOW 25 ms (target 360 baud) untuk mengirim
-satu frame `0x00` (start bit + 8 bit data, LOW sekitar 25 ms), lalu menahan idle
-HIGH selama total 25 ms. Baud aktual dibaca dan dicatat; setelah itu UART
-kembali ke 10400 baud. W4 tambahan disetel 0 us karena fase HIGH 25 ms sudah
-dilaksanakan di Fast Init; wake-up `FE 04 72 8C` dikirim setelah pembersihan RX.
+parameter timing bisa diubah dari input dashboard atau query POST
+`/api/start-diagnostic?low=25&high=25&w4=0&gap=0&idle=3000`. Nilai default
+adalah idle 3000 ms, LOW 25 ms, HIGH 25 ms, W4 0 us, dan byte gap 0 us.
+Endpoint menolak nilai di luar rentang LOW 10-110 ms, HIGH 10-200 ms,
+W4 0-50000 us, gap 0-5000 us, dan idle 300-5000 ms. Baud Fast Init dihitung
+dari durasi LOW (target 360 baud pada 25 ms) untuk mengirim satu frame `0x00`
+(start bit + 8 bit data, LOW sekitar 25 ms), lalu menahan idle HIGH sesuai
+parameter. Baud aktual dibaca, dicatat, dan Fast Init dibatalkan jika selisih
+target melebihi 2%; setelah pulsa UART kembali ke 10400 baud. W4 tambahan
+default 0 us karena fase HIGH sudah dilaksanakan di Fast Init; wake-up
+`FE 04 72 8C` dikirim setelah pembersihan RX.
 UART tetap 8N1 inverted dan TX tidak dipetakan ulang selama urutan init. Timeout
 respons 120 ms dan TX tanpa jeda antar-byte yang dikonfigurasi. ACK wake-up
 standar `0E 04 72 7C` tetap diterima; dua varian yang dilaporkan AGY

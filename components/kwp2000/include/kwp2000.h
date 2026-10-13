@@ -40,18 +40,27 @@ typedef struct {
     bool is_valid;
 } kwp2000_message_t;
 
+typedef struct {
+    uint32_t idle_ms;
+    uint32_t low_ms;
+    uint32_t high_ms;
+    uint32_t w4_us;
+    uint32_t byte_gap_us;
+} kwp_init_params_t;
+
 // Inisialisasi awal port & driver K-Line
 void kwp2000_init(int rx_gpio, int tx_gpio, int baudrate);
 
 // Eksekusi Fast Init melalui UART (25ms LOW / 25ms HIGH)
-bool kwp2000_fast_init(void);
+bool kwp2000_fast_init(const kwp_init_params_t *params);
 
 // Pengujian hardware fisik Bus LOW / Bus HIGH
 bool kwp2000_start_tx_hardware_test(bool force_bus_low);
 void kwp2000_stop_tx_hardware_test(void);
 
 // Mulai sesi diagnostik Honda K-Line
-bool kwp2000_begin_diagnostic_session(uint8_t session_type);
+bool kwp2000_begin_diagnostic_session(uint8_t session_type,
+                                      const kwp_init_params_t *params);
 
 // Reset status sesi diagnostik
 void kwp2000_reset_session(void);

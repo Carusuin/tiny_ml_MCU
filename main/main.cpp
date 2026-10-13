@@ -40,6 +40,13 @@ static SemaphoreHandle_t diagnostic_state_mutex = NULL;
 
 static vprintf_like_t web_log_previous_vprintf = NULL;
 static bool diagnostic_request_active = false;
+static kwp_init_params_t diagnostic_request_params = {
+    .idle_ms = 3000,
+    .low_ms = 25,
+    .high_ms = 25,
+    .w4_us = 0,
+    .byte_gap_us = 0,
+};
 
 static int web_log_vprintf(const char *format, va_list args)
 {
@@ -163,6 +170,12 @@ static const char *dashboard_html = R"html(
   <button id="initButton" onclick="startDiagnostic()" style="margin-top:20px;padding:12px 18px;">
     Start K-Line Communication
   </button>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+    <label>LOW (ms) <input id="initLow" type="number" min="10" max="110" value="25" style="width:70px;"></label>
+    <label>HIGH (ms) <input id="initHigh" type="number" min="10" max="200" value="25" style="width:70px;"></label>
+    <label>W4 (us) <input id="initW4" type="number" min="0" max="50000" value="0" style="width:80px;"></label>
+    <label>Byte gap (us) <input id="initGap" type="number" min="0" max="5000" value="0" style="width:80px;"></label>
+  </div>
   <div id="initMessage" style="margin-top:12px;"></div>
   <div class="card" style="margin-top:20px;">
     <div class="label">TX Hardware Test (45 second timeout)</div>
@@ -230,8 +243,17 @@ static const char *dashboard_html = R"html(
       button.disabled = true;
       message.textContent = 'Starting K-Line initialization...';
       try {
-        const response = await fetch('/api/start-diagnostic', { method: 'POST' });
+        const params = new URLSearchParams();
+        [['low', 'initLow'], ['high', 'initHigh'], ['w4', 'initW4'], ['gap', 'initGap']]
+          .forEach(([key, id]) => {
+            const value = document.getElementById(id).value;
+            if (value !== '') params.set(key, value);
+          });
+        const query = params.toString();
+        const response = await fetch('/api/start-diagnostic' + (query ? '?' + query : ''),
+                                     { method: 'POST' });
         const data = await response.json();
+        if (!response.ok) throw new Error(data.message || 'Invalid timing parameters');
         message.textContent = data.message || (data.success
           ? 'K-Line communication started' : 'K-Line initialization failed');
       } catch (error) {
@@ -377,8 +399,62 @@ static const httpd_uri_t uri_dtc = {
 };
 
 // Handler start diagnostic menjadi Asynchronous agar tidak memblokir HTTP Server
+static bool parse_timing_query_value(const char *query,
+                                     const char *key,
+                                     uint32_t minimum,
+                                     uint32_t maximum,
+                                     uint32_t *output)
+{
+    char value[16];
+    esp_err_t err = httpd_query_key_value(query, key, value, sizeof(value));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK || value[0] == '-') {
+        return false;
+    }
+
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed > UINT32_MAX ||
+        parsed < minimum || parsed > maximum) {
+        return false;
+    }
+    *output = (uint32_t)parsed;
+    return true;
+}
+
 static esp_err_t start_diagnostic_handler(httpd_req_t *req)
 {
+    kwp_init_params_t requested_params = {
+        .idle_ms = 3000,
+        .low_ms = 25,
+        .high_ms = 25,
+        .w4_us = 0,
+        .byte_gap_us = 0,
+    };
+    char query[128] = {};
+    esp_err_t query_err = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (query_err != ESP_OK && query_err != ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req,
+                           "{\"success\":false,\"message\":\"Invalid timing query\"}");
+        return ESP_OK;
+    }
+    if (query_err == ESP_OK &&
+        (!parse_timing_query_value(query, "low", 10, 110, &requested_params.low_ms) ||
+         !parse_timing_query_value(query, "high", 10, 200, &requested_params.high_ms) ||
+         !parse_timing_query_value(query, "w4", 0, 50000, &requested_params.w4_us) ||
+         !parse_timing_query_value(query, "gap", 0, 5000, &requested_params.byte_gap_us) ||
+         !parse_timing_query_value(query, "idle", 300, 5000, &requested_params.idle_ms))) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req,
+                           "{\"success\":false,\"message\":\"Timing parameter out of range\"}");
+        return ESP_OK;
+    }
+
     if (diagnostic_request_sem == NULL || diagnostic_state_mutex == NULL ||
         xSemaphoreTake(diagnostic_state_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -396,6 +472,7 @@ static esp_err_t start_diagnostic_handler(httpd_req_t *req)
     }
 
     diagnostic_request_active = true;
+    diagnostic_request_params = requested_params;
     BaseType_t request_queued = xSemaphoreGive(diagnostic_request_sem);
     if (request_queued != pdTRUE) {
         diagnostic_request_active = false;
@@ -706,9 +783,28 @@ void app_test_kwp2000(void *arg)
             xSemaphoreTake(diagnostic_request_sem, 0) == pdTRUE) {
             ESP_LOGI(TAG, "Executing Fast Init requested from Web UI...");
 
-            if (kwp_mutex != NULL &&
+            kwp_init_params_t requested_params = {};
+            bool params_ready = false;
+            if (diagnostic_state_mutex != NULL &&
+                xSemaphoreTake(diagnostic_state_mutex, portMAX_DELAY) == pdTRUE) {
+                requested_params = diagnostic_request_params;
+                params_ready = true;
+                xSemaphoreGive(diagnostic_state_mutex);
+            }
+
+            if (!params_ready) {
+                ESP_LOGE(TAG, "Unable to load diagnostic timing parameters");
+            } else if (kwp_mutex != NULL &&
                 xSemaphoreTake(kwp_mutex, portMAX_DELAY) == pdTRUE) {
-                bool success = kwp2000_begin_diagnostic_session(0x81);
+                ESP_LOGI(TAG,
+                         "Init params idle=%lu ms low=%lu ms high=%lu ms W4=%lu us gap=%lu us",
+                         (unsigned long)requested_params.idle_ms,
+                         (unsigned long)requested_params.low_ms,
+                         (unsigned long)requested_params.high_ms,
+                         (unsigned long)requested_params.w4_us,
+                         (unsigned long)requested_params.byte_gap_us);
+                bool success = kwp2000_begin_diagnostic_session(0x81,
+                                                                 &requested_params);
                 if (success) {
                     ESP_LOGI(TAG, "K-Line Session Initialized Successfully");
                 } else {
