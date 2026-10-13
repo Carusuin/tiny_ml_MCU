@@ -10,7 +10,7 @@ Dokumen ini berisi dokumentasi teknis lengkap alur komunikasi K-Line untuk ECU H
 | :--- | :--- | :--- |
 | **Baud Rate** | `10,400 bps` | Terkunci (Fixed Baudrate), 8 Data Bits, No Parity, 1 Stop Bit (8N1) |
 | **Sinyal Fisik K-Line** | Active LOW / Idle HIGH (12V) | Memerlukan K-Line Transceiver + Inversion Signal (TXD & RXD) |
-| **Durasi Fast Init** | `25 ms` LOW, `25 ms` HIGH | Dieksekusi via Bit-Bang sebelum UART Serial diaktifkan |
+| **Durasi Fast Init** | `25 ms` LOW, `25 ms` HIGH | Firmware ESP32 mempertahankan pin TX pada UART; pulsa LOW dibentuk dengan baud sementara dan frame `0x00` |
 | **Inter-frame W4 Delay** | `0 ms` s/d `15 ms` | Delay batas transisi dari Fast Init ke pengiriman Wake-Up Frame |
 | **Algoritma Checksum** | 2's Complement Sum | $(0x100 - (\sum \text{bytes} \pmod{256})) \pmod{256}$ |
 
@@ -25,10 +25,10 @@ sequenceDiagram
     participant KLine as Bus K-Line (12V)
     participant ECU as ECU Honda K15
 
-    Note over ESP32,ECU: Tahap 1: Fast Init (Bit-Bang Sinyal Fisik)
-    ESP32->>KLine: Set Pin TX = LOW (0V) selama 25 ms
-    ESP32->>KLine: Set Pin TX = HIGH (12V) selama 25 ms
-    Note over ESP32: Switch Mode Pin ke UART 10,400 bps
+    Note over ESP32,ECU: Tahap 1: Fast Init melalui UART
+    ESP32->>KLine: UART baud sementara + frame 00 membentuk LOW sekitar 25 ms
+    ESP32->>KLine: UART stop bit/idle mempertahankan HIGH hingga total sekitar 25 ms
+    Note over ESP32: Pulihkan baud ke UART 10,400 bps
 
     Note over ESP32,ECU: Tahap 2: Wake-Up Handshake Frame
     ESP32->>ECU: Kirim Wake-Up Request: [FE 04 72 8C]
@@ -48,21 +48,20 @@ sequenceDiagram
 
 ---
 
-## 1️⃣ Tahap 1: Fast Init (Physical Layer Bit-Bang)
+## 1️⃣ Tahap 1: Fast Init via UART
 
 Sebelum komunikasi serial UART 10,400 bps dibuka, K-Line membutuhkan pulsa inisialisasi awal (*Fast Init*) untuk membangunkan ECU dari mode standby.
 
 ### Langkah Eksekusi:
-1. **Reset Pin TX** menjadi Output Digital GPIO biasa (Non-UART).
-2. **Kirim Pulsa LOW (0V):** Tahan logika `0` selama tepat **`25 ms`** ($25,000\ \mu\text{s}$).
-3. **Kirim Pulsa HIGH (12V):** Tahan logika `1` selama tepat **`25 ms`** ($25,000\ \mu\text{s}$).
-4. **Buka Port UART:** Segera konfigurasi pin TX & RX menjadi UART Serial dengan parameter:
+1. **Pertahankan TX pada periferal UART**; firmware saat ini memakai baud sementara `360` untuk mengirim frame `0x00` 8N1. Start bit dan delapan bit data LOW membentuk pulsa bus LOW sekitar **`25 ms`** pada konfigurasi TX terinversi/transceiver inverting.
+2. Stop bit dan kondisi UART idle membentuk level bus HIGH; firmware menahan fase HIGH hingga total sekitar **`25 ms`**.
+3. **Pulihkan baud UART** ke `10,400 bps`, lalu tunggu W4 sebelum mengirim wake-up.
+4. Parameter komunikasi UART normal:
    * Baud Rate: `10,400 bps`
    * Data Bits: `8 bits`, Stop Bits: `1 bit`, Parity: `None`
    * Inversion: `Active LOW / Line Inverted` (`UART_SIGNAL_TXD_INV | UART_SIGNAL_RXD_INV`).
 
-> ⚠️ **Catatan Penting ESP32:**
-> Jalankan pulsa 25ms di dalam *Critical Section* (`portENTER_CRITICAL`) untuk mencegah interupsi dari task FreeRTOS/WiFi yang bisa membuat durasi pulsa bergeser.
+> **Catatan validasi:** pendekatan baud sementara mempertahankan TX pada periferal UART, tetapi durasi dan polaritas pulsa aktual harus diverifikasi pada output transceiver/K-Line. UART RX ditahan pada level idle selama Fast Init agar pulsa tidak didekode sebagai byte RX.
 
 ---
 

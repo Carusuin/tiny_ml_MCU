@@ -24,6 +24,7 @@ static const char *TAG = "KWP2000";
 
 #define KWP_FAST_INIT_LOW_US    25000
 #define KWP_FAST_INIT_HIGH_US   25000
+#define KWP_FAST_INIT_UART_BAUD 360
 #define KWP_FAST_INIT_W4_US     10000
 #define KWP_FAST_INIT_IDLE_MS   3000
 
@@ -339,6 +340,7 @@ static bool kwp_uart_write_frame(const uint8_t *buffer, int frame_len)
 {
     if (buffer == NULL || frame_len <= 0) return false;
 
+    int64_t tx_start_us = esp_timer_get_time();
     if (uart_write_bytes(KWP_UART_NUM, (const char *)buffer, frame_len) != frame_len) {
         ESP_LOGE(TAG, "UART write failed");
         return false;
@@ -347,6 +349,14 @@ static bool kwp_uart_write_frame(const uint8_t *buffer, int frame_len)
     if (uart_wait_tx_done(KWP_UART_NUM, pdMS_TO_TICKS(KWP_TX_TIMEOUT_MS)) != ESP_OK) {
         ESP_LOGE(TAG, "UART TX timed out");
         return false;
+    }
+
+    uint64_t expected_wire_us =
+        ((uint64_t)frame_len * 10U * 1000000U + (uint32_t)kwp_baudrate - 1U) /
+        (uint32_t)kwp_baudrate;
+    int64_t elapsed_us = esp_timer_get_time() - tx_start_us;
+    if (elapsed_us < (int64_t)expected_wire_us) {
+        esp_rom_delay_us((uint32_t)(expected_wire_us - (uint64_t)elapsed_us));
     }
 
     return true;
@@ -606,31 +616,70 @@ void kwp2000_init(int rx_gpio, int tx_gpio, int baudrate)
 
 bool kwp2000_fast_init(void)
 {
-    int64_t idle_start_us = esp_timer_get_time();
-    ESP_ERROR_CHECK(gpio_reset_pin((gpio_num_t)kwp_tx_gpio));
-    ESP_ERROR_CHECK(gpio_set_direction((gpio_num_t)kwp_tx_gpio, GPIO_MODE_OUTPUT));
-    ESP_ERROR_CHECK(gpio_set_pull_mode((gpio_num_t)kwp_tx_gpio, GPIO_PULLDOWN_ONLY));
+    if (!kwp_uart_installed) {
+        ESP_LOGE(TAG, "Cannot run UART Fast Init before UART is installed");
+        return false;
+    }
 
-    // Idle HIGH 3 detik
-    kline_drive(false);
+    int64_t idle_start_us = esp_timer_get_time();
     vTaskDelay(pdMS_TO_TICKS(KWP_FAST_INIT_IDLE_MS));
     int64_t idle_end_us = esp_timer_get_time();
 
-    // Pulsa LOW 25ms
-    kline_drive(true);
-    int64_t low_start_us = esp_timer_get_time();
-    esp_rom_delay_us(KWP_FAST_INIT_LOW_US);
+    ESP_RETURN_ON_ERROR(uart_set_baudrate(KWP_UART_NUM, KWP_FAST_INIT_UART_BAUD),
+                        TAG, "Failed to set UART Fast Init baud rate");
 
-    // Pulsa HIGH 25ms
-    kline_drive(false);
-    int64_t high_start_us = esp_timer_get_time();
-    esp_rom_delay_us(KWP_FAST_INIT_HIGH_US);
+    const uint8_t low_pulse_frame = 0x00;
+    int written = uart_write_bytes(KWP_UART_NUM,
+                                   (const char *)&low_pulse_frame,
+                                   sizeof(low_pulse_frame));
+    if (written != sizeof(low_pulse_frame)) {
+        esp_err_t restore_err = uart_set_baudrate(KWP_UART_NUM, kwp_baudrate);
+        if (restore_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restore UART baud rate after Fast Init TX error: %s",
+                     esp_err_to_name(restore_err));
+        }
+        ESP_LOGE(TAG, "Failed to queue UART Fast Init low pulse");
+        return false;
+    }
+
+    if (uart_wait_tx_done(KWP_UART_NUM, pdMS_TO_TICKS(KWP_TX_TIMEOUT_MS)) != ESP_OK) {
+        esp_err_t restore_err = uart_set_baudrate(KWP_UART_NUM, kwp_baudrate);
+        if (restore_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restore UART baud rate after Fast Init TX timeout: %s",
+                     esp_err_to_name(restore_err));
+        }
+        ESP_LOGE(TAG, "UART Fast Init low pulse timed out");
+        return false;
+    }
+
+    int64_t frame_done_us = esp_timer_get_time();
+    const int64_t low_pulse_us =
+        (9LL * 1000000LL + KWP_FAST_INIT_UART_BAUD - 1) /
+        KWP_FAST_INIT_UART_BAUD;
+    const int64_t stop_bit_us =
+        (1000000LL + KWP_FAST_INIT_UART_BAUD - 1) /
+        KWP_FAST_INIT_UART_BAUD;
+    int64_t high_start_us = frame_done_us - stop_bit_us;
+    int64_t high_elapsed_us = stop_bit_us;
+    if (high_elapsed_us < KWP_FAST_INIT_HIGH_US) {
+        esp_rom_delay_us((uint32_t)(KWP_FAST_INIT_HIGH_US - high_elapsed_us));
+    }
     int64_t high_end_us = esp_timer_get_time();
+
+    ESP_RETURN_ON_ERROR(uart_set_baudrate(KWP_UART_NUM, kwp_baudrate),
+                        TAG, "Failed to restore UART baud rate after Fast Init");
+
     kwp_fast_init_idle_us = idle_end_us - idle_start_us;
-    kwp_fast_init_low_us = high_start_us - low_start_us;
+    kwp_fast_init_low_us = low_pulse_us;
     kwp_fast_init_high_us = high_end_us - high_start_us;
     kwp_fast_init_high_end_us = high_end_us;
 
+    ESP_LOGI(TAG,
+             "TIMING UART Fast Init: baud=%d, low-pulse=%lld us, stop-bit=%lld us, high-total=%lld us",
+             KWP_FAST_INIT_UART_BAUD,
+             (long long)kwp_fast_init_low_us,
+             (long long)stop_bit_us,
+             (long long)kwp_fast_init_high_us);
     return true;
 }
 

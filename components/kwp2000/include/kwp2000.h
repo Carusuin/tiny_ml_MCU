@@ -43,7 +43,7 @@ typedef struct {
 // Inisialisasi awal port & driver K-Line
 void kwp2000_init(int rx_gpio, int tx_gpio, int baudrate);
 
-// Eksekusi Fast Init Bit-Bang (25ms LOW / 25ms HIGH)
+// Eksekusi Fast Init melalui UART (25ms LOW / 25ms HIGH)
 bool kwp2000_fast_init(void);
 
 // Pengujian hardware fisik Bus LOW / Bus HIGH

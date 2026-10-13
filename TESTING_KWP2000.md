@@ -5,13 +5,18 @@ Ini adalah setup untuk test komunikasi KWP2000 antara ESP32 dan ECU emulator (Py
 
 ## Profil timing dan pemetaan sensor (uji AGY)
 
-Firmware saat ini memakai Fast Init LOW 25 ms + HIGH 25 ms, W4 10 ms, UART
-10400 baud 8N1 inverted, timeout respons 120 ms, dan TX tanpa jeda antar-byte
+Firmware saat ini menghasilkan Fast Init dengan UART tetap tersambung ke TX:
+baud sementara 360 untuk mengirim satu frame `0x00` (LOW sekitar 25 ms), lalu
+menahan idle HIGH selama total 25 ms. Setelah itu baud kembali ke 10400, W4
+10 ms, UART 8N1 inverted, timeout respons 120 ms, dan TX tanpa jeda antar-byte
 yang dikonfigurasi. ACK wake-up standar `0E 04 72 7C` tetap diterima; dua varian yang
 dilaporkan AGY (`0E 04 72` tanpa checksum dan `72 8C`) belum diterima oleh
 parser saat ini. Parser RX berjalan per byte dan mempertahankan `0xFE` kedua
 jika ada beberapa `0xFE` berturut-turut, sehingga header wake-up berikutnya
 tetap dapat diselaraskan. Echo hanya dibuang jika seluruh frame cocok dengan TX.
+Sesudah `uart_wait_tx_done()`, firmware memastikan waktu tunggu TX sekurangnya
+panjang frame 8N1 pada baud yang dikonfigurasi (10 bit per byte), agar proses
+lanjut tidak mendahului waktu transmisi minimum.
 Dashboard kini menampilkan stream byte mentah yang dibaca dari UART RX pada
 panel **Raw UART RX Bytes (hex)**. Riwayat menyimpan hingga 1024 byte terakhir;
 counter menunjukkan berapa byte lama yang tertimpa. Gunakan **Clear RX** sebelum
