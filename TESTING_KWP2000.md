@@ -6,14 +6,18 @@ Ini adalah setup untuk test komunikasi KWP2000 antara ESP32 dan ECU emulator (Py
 ## Profil timing dan pemetaan sensor (uji AGY)
 
 Firmware saat ini menghasilkan Fast Init dengan UART tetap tersambung ke TX:
-baud sementara 360 untuk mengirim satu frame `0x00` (LOW sekitar 25 ms), lalu
-menahan idle HIGH selama total 25 ms. Setelah itu baud kembali ke 10400, W4
-10 ms, UART 8N1 inverted, timeout respons 120 ms, dan TX tanpa jeda antar-byte
-yang dikonfigurasi. ACK wake-up standar `0E 04 72 7C` tetap diterima; dua varian yang
-dilaporkan AGY (`0E 04 72` tanpa checksum dan `72 8C`) belum diterima oleh
-parser saat ini. Parser RX berjalan per byte dan mempertahankan `0xFE` kedua
-jika ada beberapa `0xFE` berturut-turut, sehingga header wake-up berikutnya
-tetap dapat diselaraskan. Echo hanya dibuang jika seluruh frame cocok dengan TX.
+baud sementara dihitung dari durasi LOW 25 ms (target 360 baud) untuk mengirim
+satu frame `0x00` (start bit + 8 bit data, LOW sekitar 25 ms), lalu menahan idle
+HIGH selama total 25 ms. Baud aktual dibaca dan dicatat; setelah itu UART
+kembali ke 10400 baud. W4 tambahan disetel 0 us karena fase HIGH 25 ms sudah
+dilaksanakan di Fast Init; wake-up `FE 04 72 8C` dikirim setelah pembersihan RX.
+UART tetap 8N1 inverted dan TX tidak dipetakan ulang selama urutan init. Timeout
+respons 120 ms dan TX tanpa jeda antar-byte yang dikonfigurasi. ACK wake-up
+standar `0E 04 72 7C` tetap diterima; dua varian yang dilaporkan AGY
+(`0E 04 72` tanpa checksum dan `72 8C`) belum diterima oleh parser saat ini.
+Parser RX berjalan per byte dan mempertahankan `0xFE` kedua jika ada beberapa
+`0xFE` berturut-turut, sehingga header wake-up berikutnya tetap dapat
+diselaraskan. Echo hanya dibuang jika seluruh frame cocok dengan TX.
 Sesudah `uart_wait_tx_done()`, firmware memastikan waktu tunggu TX sekurangnya
 panjang frame 8N1 pada baud yang dikonfigurasi (10 bit per byte), agar proses
 lanjut tidak mendahului waktu transmisi minimum.
@@ -24,15 +28,15 @@ satu percobaan agar echo dan respons percobaan itu mudah dibedakan. Byte yang
 sudah berada di buffer driver sebelum buffer dibersihkan juga direkam. Byte yang
 hilang karena overflow hardware/UART tidak dapat dipulihkan oleh firmware.
 Serial Monitor menampilkan baris `TIMING` untuk durasi idle, pulsa LOW/HIGH,
-perpindahan Fast Init ke UART, W4, pengiriman wake-up, dan waktu pembacaan byte
-RX relatif terhadap awal percobaan. Timestamp RX menunjukkan saat task membaca
-byte dari driver UART, bukan waktu tepi sinyal yang diukur langsung pada bus.
-RX task dijeda saat persiapan dan Fast Init agar tidak berkompetisi membaca/
-mengosongkan UART. Selama pulsa, input periferal UART ditahan pada level idle
-logis agar transisi Fast Init pada bus tidak membentuk byte RX; pin RX fisik
-dipulihkan setelah pulsa selesai. W4 yang dilaporkan adalah waktu dari akhir
-pulsa HIGH sampai awal pengiriman wake-up. Firmware memberi peringatan jika
-waktu aktual melebihi 15 ms.
+baud target/aktual, W4, pengiriman wake-up, dan ringkasan RX per-exchange.
+Timestamp RX adalah waktu task membaca byte dari driver UART, bukan waktu tepi
+sinyal yang diukur langsung pada bus. RX task dijeda selama Fast Init tanpa
+mengalihkan pin RX UART. Setelah pulsa, firmware mencatat jumlah byte yang
+tertahan, membaca dan merekam byte ke Raw RX, menampilkan nilainya di log, lalu
+melakukan flush sebelum wake-up agar byte init tidak diproses sebagai respons.
+Jika buffer kosong, log menyatakan tidak ada byte yang diterima driver. W4 yang
+dilaporkan adalah waktu dari akhir pulsa HIGH sampai awal pengiriman wake-up;
+nilai aktual mencakup pencatatan dan pembersihan RX.
 Untuk tabel data ID `0x10`, pemetaan uji diterapkan langsung ke indeks response
 yang dikembalikan (byte ID berada di indeks 0):
 

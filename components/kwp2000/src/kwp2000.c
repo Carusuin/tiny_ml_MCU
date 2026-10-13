@@ -187,10 +187,11 @@ static int kwp_uart_read_captured(uint8_t *buffer,
     return received;
 }
 
-static void kwp_capture_pending_rx(void)
+static size_t kwp_capture_pending_rx(uint8_t *captured, size_t capacity)
 {
     uint8_t buffer[64];
     size_t buffered = 0;
+    size_t total_received = 0;
 
     if (uart_get_buffered_data_len(KWP_UART_NUM, &buffered) == ESP_OK) {
         size_t remaining = buffered;
@@ -202,9 +203,83 @@ static void kwp_capture_pending_rx(void)
             if (received <= 0) {
                 break;
             }
+            size_t copy_length = (size_t)received;
+            if (total_received + copy_length > capacity) {
+                copy_length = total_received < capacity
+                                  ? capacity - total_received
+                                  : 0;
+            }
+            if (captured != NULL && copy_length > 0) {
+                memcpy(captured + total_received, buffer, copy_length);
+            }
+            total_received += (size_t)received;
             remaining -= (size_t)received;
         }
     }
+    return total_received;
+}
+
+static void kwp_log_pending_rx_and_flush(const char *phase)
+{
+    size_t buffered_before = 0;
+    size_t buffered_after_capture = 0;
+    uint8_t captured[KWP_UART_BUFFER_SIZE];
+    size_t captured_count = 0;
+    size_t stored_count = 0;
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        ESP_ERROR_CHECK(uart_get_buffered_data_len(KWP_UART_NUM, &buffered_after_capture));
+        if (attempt == 0) {
+            buffered_before = buffered_after_capture;
+            ESP_LOGI(TAG, "%s UART RX buffered before capture: %u byte(s)",
+                     phase, (unsigned)buffered_before);
+        }
+        if (buffered_after_capture == 0) {
+            break;
+        }
+
+        size_t received = kwp_capture_pending_rx(
+            captured + stored_count, sizeof(captured) - stored_count);
+        if (received == 0) {
+            break;
+        }
+        captured_count += received;
+        stored_count = captured_count < sizeof(captured)
+                           ? captured_count
+                           : sizeof(captured);
+    }
+    ESP_ERROR_CHECK(uart_get_buffered_data_len(KWP_UART_NUM, &buffered_after_capture));
+
+    if (captured_count == 0) {
+        ESP_LOGI(TAG, "%s UART RX capture: no bytes (driver buffer was empty)",
+                 phase);
+    } else {
+        static const char hex_digits[] = "0123456789ABCDEF";
+        for (size_t base = 0; base < stored_count; base += 32) {
+            char hex[32 * 3];
+            size_t length = 0;
+            size_t stop = base + 32 < stored_count ? base + 32 : stored_count;
+            for (size_t i = base; i < stop; i++) {
+                if (i > base) hex[length++] = ' ';
+                hex[length++] = hex_digits[captured[i] >> 4];
+                hex[length++] = hex_digits[captured[i] & 0x0F];
+            }
+            hex[length] = '\0';
+            ESP_LOGI(TAG, "%s UART RX captured [%u-%u]: %s",
+                     phase, (unsigned)base, (unsigned)(stop - 1), hex);
+        }
+        if (captured_count > stored_count) {
+            ESP_LOGW(TAG, "%s UART RX captured %u byte(s); only first %u fit in log buffer",
+                     phase, (unsigned)captured_count, (unsigned)stored_count);
+        }
+    }
+
+    ESP_LOGI(TAG, "%s UART RX buffered immediately before flush: %u byte(s)",
+             phase, (unsigned)buffered_after_capture);
+    if (buffered_after_capture > 0) {
+        ESP_LOGW(TAG, "%s UART RX still had pending data at flush", phase);
+    }
+    ESP_ERROR_CHECK(uart_flush_input(KWP_UART_NUM));
 }
 
 static void kwp_log_rx_exchange_summary(const uint8_t *tx,
@@ -389,7 +464,7 @@ static bool kwp_configure_uart(bool start_task)
         kwp_uart_installed = true;
 
         vTaskDelay(pdMS_TO_TICKS(50));
-        kwp_capture_pending_rx();
+        kwp_capture_pending_rx(NULL, 0);
         ESP_ERROR_CHECK(uart_flush_input(KWP_UART_NUM));
 
         ESP_LOGI(TAG, "UART initialized on RX=%d, TX=%d, Baud=%d, Invert=%d",
@@ -817,15 +892,13 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type)
     }
 
     if (!kwp2000_fast_init()) {
-        kwp_capture_pending_rx();
-        ESP_ERROR_CHECK(uart_flush_input(KWP_UART_NUM));
+        kwp_log_pending_rx_and_flush("Fast Init failure");
         kwp_resume_rx_task();
         kwp_diagnostic_timing_stop();
         return false;
     }
 
-    kwp_capture_pending_rx();
-    ESP_ERROR_CHECK(uart_flush_input(KWP_UART_NUM));
+    kwp_log_pending_rx_and_flush("Fast Init complete");
     int64_t rx_cleanup_us = esp_timer_get_time();
 
     int64_t w4_elapsed_us = rx_cleanup_us - kwp_fast_init_high_end_us;
@@ -959,7 +1032,7 @@ bool kwp2000_read_data_by_id(uint16_t data_id,
     tx_frame[4] = kwp2000_calculate_checksum(tx_frame, 4);
 
     if (kwp_response_queue != NULL) xQueueReset(kwp_response_queue);
-    kwp_capture_pending_rx();
+    kwp_capture_pending_rx(NULL, 0);
     uart_flush_input(KWP_UART_NUM);
 
     if (!kwp2000_send_bytes(tx_frame, sizeof(tx_frame))) return false;
