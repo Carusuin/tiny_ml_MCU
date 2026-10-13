@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -22,10 +23,11 @@
 
 static const char *TAG = "APP_MAIN";
 
-#define WEB_LOG_LINE_COUNT 64
+#define WEB_LOG_LINE_COUNT 128
 #define WEB_LOG_LINE_SIZE 256
 
 static char web_log_lines[WEB_LOG_LINE_COUNT][WEB_LOG_LINE_SIZE];
+static size_t web_log_line_capacity = 64;
 static size_t web_log_count = 0;
 static size_t web_log_next = 0;
 
@@ -58,8 +60,8 @@ static int web_log_vprintf(const char *format, va_list args)
         if (web_log_mutex && xSemaphoreTake(web_log_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             strncpy(web_log_lines[web_log_next], line, WEB_LOG_LINE_SIZE - 1);
             web_log_lines[web_log_next][WEB_LOG_LINE_SIZE - 1] = '\0';
-            web_log_next = (web_log_next + 1) % WEB_LOG_LINE_COUNT;
-            if (web_log_count < WEB_LOG_LINE_COUNT) {
+            web_log_next = (web_log_next + 1) % web_log_line_capacity;
+            if (web_log_count < web_log_line_capacity) {
                 web_log_count++;
             }
             xSemaphoreGive(web_log_mutex);
@@ -480,22 +482,43 @@ static esp_err_t logs_json_handler(httpd_req_t *req)
 
     const size_t snapshot_count = web_log_count;
     const size_t snapshot_first =
-        (web_log_next + WEB_LOG_LINE_COUNT - snapshot_count) % WEB_LOG_LINE_COUNT;
+        (web_log_next + web_log_line_capacity - snapshot_count) % web_log_line_capacity;
+    xSemaphoreGive(web_log_mutex);
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t err = httpd_resp_sendstr_chunk(req, "{\"lines\":[");
 
     for (size_t i = 0; err == ESP_OK && i < snapshot_count; i++) {
-        const char *line = web_log_lines[(snapshot_first + i) % WEB_LOG_LINE_COUNT];
-        char escaped[WEB_LOG_LINE_SIZE * 2];
-        size_t escaped_len = 0;
+        if (xSemaphoreTake(web_log_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+            err = ESP_FAIL;
+            break;
+        }
+        char line_copy[WEB_LOG_LINE_SIZE];
+        size_t line_index = (snapshot_first + i) % web_log_line_capacity;
+        memcpy(line_copy, web_log_lines[line_index], sizeof(line_copy));
+        line_copy[sizeof(line_copy) - 1] = '\0';
+        xSemaphoreGive(web_log_mutex);
 
-        for (size_t j = 0; line[j] != '\0' && escaped_len + 2 < sizeof(escaped); j++) {
-            char c = line[j];
-            if (c == '\\' || c == '"') escaped[escaped_len++] = '\\';
-            else if (c == '\n') { escaped[escaped_len++] = '\\'; escaped[escaped_len++] = 'n'; continue; }
-            else if (c == '\r') continue;
-            escaped[escaped_len++] = c;
+        char escaped[WEB_LOG_LINE_SIZE * 6];
+        size_t escaped_len = 0;
+        static const char hex_digits[] = "0123456789ABCDEF";
+
+        for (size_t j = 0; line_copy[j] != '\0'; j++) {
+            uint8_t c = (uint8_t)line_copy[j];
+            if (c < 0x20) {
+                if (escaped_len + 6 >= sizeof(escaped)) break;
+                escaped[escaped_len++] = '\\';
+                escaped[escaped_len++] = 'u';
+                escaped[escaped_len++] = '0';
+                escaped[escaped_len++] = '0';
+                escaped[escaped_len++] = hex_digits[c >> 4];
+                escaped[escaped_len++] = hex_digits[c & 0x0F];
+            } else {
+                if ((c == '\\' || c == '"') && escaped_len + 2 >= sizeof(escaped)) break;
+                if (escaped_len + 1 >= sizeof(escaped)) break;
+                if (c == '\\' || c == '"') escaped[escaped_len++] = '\\';
+                escaped[escaped_len++] = (char)c;
+            }
         }
         escaped[escaped_len] = '\0';
 
@@ -504,8 +527,6 @@ static esp_err_t logs_json_handler(httpd_req_t *req)
         if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, escaped);
         if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, "\"");
     }
-
-    xSemaphoreGive(web_log_mutex);
 
     if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, "]}");
     if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, NULL);
@@ -776,6 +797,9 @@ extern "C" void app_main(void)
 
     // Buat Mutex
     web_log_mutex = xSemaphoreCreateMutex();
+    if (esp_get_free_heap_size() > 60 * 1024) {
+        web_log_line_capacity = WEB_LOG_LINE_COUNT;
+    }
     status_mutex = xSemaphoreCreateMutex();
     kwp_mutex = xSemaphoreCreateMutex();
     diagnostic_request_sem = xSemaphoreCreateBinary();
