@@ -19,9 +19,9 @@ static const char *TAG = "KWP2000";
 #define KWP_TX_TIMEOUT_MS       1000
 #define KWP_RESPONSE_TIMEOUT_MS 120
 #define KWP_WAKEUP_RESPONSE_TIMEOUT_MS 300
+#define KWP_INIT_RESPONSE_TIMEOUT_MS  300
 
 #define KWP_FAST_INIT_RETRY_DELAY_US 2000000
-#define KWP_POST_WAKEUP_READ_DELAY_MS 50
 #define KWP_HARDWARE_TEST_TIMEOUT_US (45LL * 1000000LL)
 
 static QueueHandle_t kwp_response_queue = NULL;
@@ -72,6 +72,17 @@ typedef struct {
     size_t echo_count;
     size_t non_echo_count;
 } kwp_rx_exchange_summary_t;
+
+typedef struct {
+    size_t buffered_before;
+    size_t captured_count;
+    size_t stored_count;
+    size_t buffered_before_flush;
+    esp_err_t buffered_status;
+    esp_err_t capture_status;
+    esp_err_t flush_status;
+    uint8_t captured[KWP_UART_BUFFER_SIZE];
+} kwp_rx_cleanup_report_t;
 
 static bool kwp_pause_rx_task(void)
 {
@@ -222,67 +233,115 @@ static size_t kwp_capture_pending_rx(uint8_t *captured, size_t capacity)
     return total_received;
 }
 
-static void kwp_log_pending_rx_and_flush(const char *phase)
+static void kwp_capture_and_flush_silent(kwp_rx_cleanup_report_t *report)
 {
-    size_t buffered_before = 0;
-    size_t buffered_after_capture = 0;
-    uint8_t captured[KWP_UART_BUFFER_SIZE];
-    size_t captured_count = 0;
-    size_t stored_count = 0;
+    memset(report, 0, sizeof(*report));
+    report->buffered_status = uart_get_buffered_data_len(
+        KWP_UART_NUM, &report->buffered_before);
+    report->capture_status = ESP_OK;
+    report->flush_status = ESP_OK;
+    if (report->buffered_status != ESP_OK) {
+        report->capture_status = report->buffered_status;
+        report->flush_status = uart_flush_input(KWP_UART_NUM);
+        return;
+    }
 
-    for (int attempt = 0; attempt < 8; attempt++) {
-        ESP_ERROR_CHECK(uart_get_buffered_data_len(KWP_UART_NUM, &buffered_after_capture));
-        if (attempt == 0) {
-            buffered_before = buffered_after_capture;
-            ESP_LOGI(TAG, "%s UART RX buffered before capture: %u byte(s)",
-                     phase, (unsigned)buffered_before);
+    size_t buffered = report->buffered_before;
+    uint8_t overflow[KWP_UART_BUFFER_SIZE];
+    for (int attempt = 0; attempt < 8 && buffered > 0; attempt++) {
+        uint32_t read_length = buffered < sizeof(overflow)
+                                   ? (uint32_t)buffered
+                                   : sizeof(overflow);
+        uint8_t *destination = report->stored_count < sizeof(report->captured)
+                                   ? report->captured + report->stored_count
+                                   : overflow;
+        size_t remaining_capacity = report->stored_count < sizeof(report->captured)
+                                        ? sizeof(report->captured) - report->stored_count
+                                        : 0;
+        if (remaining_capacity > 0 && read_length > remaining_capacity) {
+            read_length = (uint32_t)remaining_capacity;
         }
-        if (buffered_after_capture == 0) {
+
+        int received = kwp_uart_read_captured(destination, read_length, 0);
+        if (received < 0) {
+            report->capture_status = ESP_FAIL;
             break;
         }
-
-        size_t received = kwp_capture_pending_rx(
-            captured + stored_count, sizeof(captured) - stored_count);
         if (received == 0) {
             break;
         }
-        captured_count += received;
-        stored_count = captured_count < sizeof(captured)
-                           ? captured_count
-                           : sizeof(captured);
-    }
-    ESP_ERROR_CHECK(uart_get_buffered_data_len(KWP_UART_NUM, &buffered_after_capture));
+        report->captured_count += (size_t)received;
+        if (remaining_capacity > 0) {
+            report->stored_count += (size_t)received;
+        }
 
-    if (captured_count == 0) {
-        ESP_LOGI(TAG, "%s UART RX capture: no bytes (driver buffer was empty)",
-                 phase);
+        report->buffered_status = uart_get_buffered_data_len(KWP_UART_NUM, &buffered);
+        if (report->buffered_status != ESP_OK) {
+            report->capture_status = report->buffered_status;
+            break;
+        }
+    }
+
+    size_t buffered_after_capture = 0;
+    report->buffered_status = uart_get_buffered_data_len(
+        KWP_UART_NUM, &buffered_after_capture);
+    if (report->buffered_status == ESP_OK) {
+        report->buffered_before_flush = buffered_after_capture;
+    } else {
+        report->capture_status = report->buffered_status;
+    }
+    report->flush_status = uart_flush_input(KWP_UART_NUM);
+}
+
+static void kwp_print_cleanup_report(const char *phase,
+                                    const kwp_rx_cleanup_report_t *report)
+{
+    ESP_LOGI(TAG, "%s UART RX buffered before capture: %u byte(s)",
+             phase, (unsigned)report->buffered_before);
+    if (report->buffered_status != ESP_OK) {
+        ESP_LOGW(TAG, "%s UART RX buffer query failed: %s",
+                 phase, esp_err_to_name(report->buffered_status));
+    }
+
+    if (report->captured_count == 0) {
+        ESP_LOGI(TAG, "%s UART RX capture: no bytes", phase);
     } else {
         static const char hex_digits[] = "0123456789ABCDEF";
-        for (size_t base = 0; base < stored_count; base += 32) {
+        for (size_t base = 0; base < report->stored_count; base += 32) {
             char hex[32 * 3];
             size_t length = 0;
-            size_t stop = base + 32 < stored_count ? base + 32 : stored_count;
+            size_t stop = base + 32 < report->stored_count
+                              ? base + 32
+                              : report->stored_count;
             for (size_t i = base; i < stop; i++) {
                 if (i > base) hex[length++] = ' ';
-                hex[length++] = hex_digits[captured[i] >> 4];
-                hex[length++] = hex_digits[captured[i] & 0x0F];
+                hex[length++] = hex_digits[report->captured[i] >> 4];
+                hex[length++] = hex_digits[report->captured[i] & 0x0F];
             }
             hex[length] = '\0';
             ESP_LOGI(TAG, "%s UART RX captured [%u-%u]: %s",
                      phase, (unsigned)base, (unsigned)(stop - 1), hex);
         }
-        if (captured_count > stored_count) {
-            ESP_LOGW(TAG, "%s UART RX captured %u byte(s); only first %u fit in log buffer",
-                     phase, (unsigned)captured_count, (unsigned)stored_count);
+        if (report->captured_count > report->stored_count) {
+            ESP_LOGW(TAG, "%s UART RX captured %u byte(s); only first %u fit in report",
+                     phase, (unsigned)report->captured_count,
+                     (unsigned)report->stored_count);
         }
     }
 
     ESP_LOGI(TAG, "%s UART RX buffered immediately before flush: %u byte(s)",
-             phase, (unsigned)buffered_after_capture);
-    if (buffered_after_capture > 0) {
+             phase, (unsigned)report->buffered_before_flush);
+    if (report->capture_status != ESP_OK) {
+        ESP_LOGW(TAG, "%s UART RX capture incomplete: %s",
+                 phase, esp_err_to_name(report->capture_status));
+    }
+    if (report->buffered_before_flush > 0) {
         ESP_LOGW(TAG, "%s UART RX still had pending data at flush", phase);
     }
-    ESP_ERROR_CHECK(uart_flush_input(KWP_UART_NUM));
+    if (report->flush_status != ESP_OK) {
+        ESP_LOGE(TAG, "%s UART RX flush failed: %s",
+                 phase, esp_err_to_name(report->flush_status));
+    }
 }
 
 static kwp_rx_exchange_summary_t kwp_log_rx_exchange_summary(const uint8_t *tx,
@@ -352,26 +411,48 @@ static kwp_rx_exchange_summary_t kwp_log_rx_exchange_summary(const uint8_t *tx,
              (unsigned)exchange_count, (unsigned)echo_count,
              (unsigned)non_echo_count, non_echo);
 
-    for (size_t base = 1; base < exchange_count; base += 16) {
-        char intervals[16 * 16];
-        size_t interval_length = 0;
-        size_t stop = base + 16 < exchange_count ? base + 16 : exchange_count;
-        for (size_t i = base; i < stop; i++) {
-            int64_t interval_us =
-                kwp_rx_summary_events[i].timestamp_us -
-                kwp_rx_summary_events[i - 1].timestamp_us;
+    char intervals[16 * 16];
+    size_t interval_length = 0;
+    size_t interval_count = 0;
+    size_t interval_group_start = 1;
+    bool have_previous_non_echo = false;
+    int64_t previous_non_echo_us = 0;
+    for (size_t i = 0; i < exchange_count; i++) {
+        if (i >= echo_offset && i < echo_offset + echo_count) {
+            continue;
+        }
+        int64_t timestamp_us = kwp_rx_summary_events[i].timestamp_us;
+        if (have_previous_non_echo) {
+            int64_t interval_us = timestamp_us - previous_non_echo_us;
             int written = snprintf(intervals + interval_length,
                                    sizeof(intervals) - interval_length,
-                                   "%s%lld", i == base ? "" : ",",
+                                   "%s%lld", interval_count == 0 ? "" : ",",
                                    (long long)interval_us);
             if (written < 0 || (size_t)written >= sizeof(intervals) - interval_length) {
                 break;
             }
             interval_length += (size_t)written;
+            interval_count++;
+            if (interval_count == 16) {
+                intervals[interval_length] = '\0';
+                ESP_LOGI(TAG, "RX non-echo inter-byte intervals us [%u-%u]: %s",
+                         (unsigned)interval_group_start,
+                         (unsigned)(interval_group_start + interval_count - 1),
+                         intervals);
+                interval_count = 0;
+                interval_length = 0;
+                interval_group_start += 16;
+            }
         }
+        previous_non_echo_us = timestamp_us;
+        have_previous_non_echo = true;
+    }
+    if (interval_count > 0) {
         intervals[interval_length] = '\0';
-        ESP_LOGI(TAG, "RX inter-byte intervals us [%u-%u]: %s",
-                 (unsigned)base, (unsigned)(stop - 1), intervals);
+        ESP_LOGI(TAG, "RX non-echo inter-byte intervals us [%u-%u]: %s",
+                 (unsigned)interval_group_start,
+                 (unsigned)(interval_group_start + interval_count - 1),
+                 intervals);
     }
     return summary;
 }
@@ -475,21 +556,6 @@ void kwp2000_reset_session(void)
 bool kwp2000_is_initialized(void)
 {
     return kwp_session_established;
-}
-
-static void kwp_stop_task(void)
-{
-    if (kwp_task_handle != NULL) {
-        kwp_task_stop_requested = true;
-        for (int i = 0; i < 50; i++) {
-            if (kwp_task_handle == NULL) break;
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        if (kwp_task_handle != NULL) {
-            vTaskDelete(kwp_task_handle);
-            kwp_task_handle = NULL;
-        }
-    }
 }
 
 static bool kwp_configure_uart(bool start_task)
@@ -910,6 +976,7 @@ bool kwp2000_fast_init(const kwp_init_params_t *params)
         return false;
     }
 
+    // This UART pattern creates the Fast Init LOW pulse; it is not a KWP data byte.
     const uint8_t low_pulse_frame = 0x00;
     int written = uart_write_bytes(KWP_UART_NUM,
                                    (const char *)&low_pulse_frame,
@@ -957,12 +1024,6 @@ bool kwp2000_fast_init(const kwp_init_params_t *params)
     kwp_fast_init_high_us = high_end_us - high_start_us;
     kwp_fast_init_high_end_us = high_end_us;
 
-    ESP_LOGI(TAG,
-             "TIMING UART Fast Init: baud=%d, low-pulse=%lld us, stop-bit=%lld us, high-total=%lld us",
-             (int)actual_baud,
-             (long long)kwp_fast_init_low_us,
-             (long long)stop_bit_us,
-             (long long)kwp_fast_init_high_us);
     return true;
 }
 
@@ -983,7 +1044,7 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type,
              (unsigned)params->w4_us,
              (unsigned)params->byte_gap_us);
     ESP_LOGI(TAG, "Starting Honda K-Line Fast Init & Diagnostic Sequence");
-    int64_t diagnostic_start_us = kwp_diagnostic_timing_start();
+    kwp_diagnostic_timing_start();
     ESP_LOGI(TAG, "TIMING +0 us diagnostic sequence started");
 
     kwp2000_stop_tx_hardware_test();
@@ -1002,14 +1063,16 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type,
     }
 
     kwp_byte_gap_us = params->byte_gap_us;
+    kwp_rx_cleanup_report_t cleanup_report;
     if (!kwp2000_fast_init(params)) {
-        kwp_log_pending_rx_and_flush("Fast Init failure");
+        kwp_capture_and_flush_silent(&cleanup_report);
+        kwp_print_cleanup_report("Fast Init failure", &cleanup_report);
         kwp_resume_rx_task();
         kwp_diagnostic_timing_stop();
         return false;
     }
 
-    kwp_log_pending_rx_and_flush("Fast Init complete");
+    kwp_capture_and_flush_silent(&cleanup_report);
     int64_t rx_cleanup_us = esp_timer_get_time();
 
     int64_t w4_elapsed_us = rx_cleanup_us - kwp_fast_init_high_end_us;
@@ -1018,12 +1081,20 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type,
         esp_rom_delay_us((uint32_t)w4_remaining_us);
     }
 
-    // Kirim Wake-up frame FE 04 72 8C
     const uint8_t wakeup_frame[] = {0xFE, 0x04, 0x72, 0x8C};
     int64_t wakeup_tx_start_us = esp_timer_get_time();
     bool wakeup_tx_ok = kwp2000_send_bytes(wakeup_frame, sizeof(wakeup_frame));
-    int64_t wakeup_tx_done_us = esp_timer_get_time();
     kwp_resume_rx_task();
+    kwp_print_cleanup_report("Fast Init complete", &cleanup_report);
+    ESP_LOGI(TAG,
+             "TIMING UART Fast Init: low-pulse=%lld us, high-total=%lld us",
+             (long long)kwp_fast_init_low_us,
+             (long long)kwp_fast_init_high_us);
+    if (!wakeup_tx_ok) {
+        kwp_diagnostic_timing_stop();
+        return false;
+    }
+
     int64_t actual_w4_us = wakeup_tx_start_us - kwp_fast_init_high_end_us;
     ESP_LOGI(TAG,
              "TIMING idle=%lld ms, Fast Init LOW=%lld us HIGH=%lld us, HIGH-end->RX-cleanup=%lld us",
@@ -1032,98 +1103,113 @@ bool kwp2000_begin_diagnostic_session(uint8_t session_type,
              (long long)kwp_fast_init_high_us,
              (long long)(rx_cleanup_us - kwp_fast_init_high_end_us));
     ESP_LOGI(TAG,
-             "TIMING W4 configured=%d us, HIGH-end->TX=%lld us, RX-cleanup->TX=%lld us, TX+drain=%lld us",
-             (int)params->w4_us,
+             "TIMING Fast Init W4 configured=%u us, HIGH-end->wake-up=%lld us, RX-cleanup->wake-up=%lld us",
+             (unsigned)params->w4_us,
              (long long)actual_w4_us,
-             (long long)(wakeup_tx_start_us - rx_cleanup_us),
-             (long long)(wakeup_tx_done_us - wakeup_tx_start_us));
-    if (actual_w4_us > 15000) {
-        ESP_LOGW(TAG, "Measured Fast Init W4 exceeded 15 ms: %lld us",
-                 (long long)actual_w4_us);
-    }
-    ESP_LOGI(TAG, "TIMING wake-up TX started at +%lld us, completed at +%lld us",
-             (long long)(wakeup_tx_start_us - diagnostic_start_us),
-             (long long)(wakeup_tx_done_us - diagnostic_start_us));
-    if (!wakeup_tx_ok) {
-        ESP_LOGW(TAG, "TIMING wake-up TX failed at +%lld us",
-                 (long long)kwp_diagnostic_elapsed_us());
-        kwp_diagnostic_timing_stop();
-        return false;
-    }
-
-    kwp2000_frame_t wakeup_response;
-    int64_t wakeup_wait_start_us = esp_timer_get_time();
-    bool wakeup_ack = kwp2000_receive_frame(&wakeup_response, KWP_WAKEUP_RESPONSE_TIMEOUT_MS);
+             (long long)(wakeup_tx_start_us - rx_cleanup_us));
+    kwp2000_frame_t response = {};
+    bool response_received = kwp2000_receive_frame(
+        &response, KWP_WAKEUP_RESPONSE_TIMEOUT_MS);
     int64_t wakeup_wait_end_us = esp_timer_get_time();
-    kwp_rx_exchange_summary_t wakeup_rx_summary =
+    kwp_rx_exchange_summary_t wakeup_summary =
         kwp_log_rx_exchange_summary(wakeup_frame, sizeof(wakeup_frame),
                                     wakeup_tx_start_us, wakeup_wait_end_us);
-    ESP_LOGI(TAG, "TIMING wake-up response wait=%lld us, result=%s",
-             (long long)(wakeup_wait_end_us - wakeup_wait_start_us),
-             wakeup_ack ? "frame received" : "timeout");
-
-    if (!wakeup_ack) {
-        ESP_LOGW(TAG,
-                 "Wake-up timeout: echo OK (%u byte), byte non-echo dalam 300 ms: %u",
-                 (unsigned)wakeup_rx_summary.echo_count,
-                 (unsigned)wakeup_rx_summary.non_echo_count);
+    if (!response_received) {
+        ESP_LOGW(TAG, "Wake-up ACK timeout: echo=%u non-echo=%u byte(s)",
+                 (unsigned)wakeup_summary.echo_count,
+                 (unsigned)wakeup_summary.non_echo_count);
         kwp_diagnostic_timing_stop();
         return false;
     }
 
     bool wakeup_ack_valid =
-        (wakeup_response.target_address == 0x0E ||
-         wakeup_response.target_address == 0x02) &&
-        wakeup_response.length == 4 &&
-        kwp_frame_checksum_valid(&wakeup_response);
+        response.target_address == 0x0E &&
+        response.length == 4 &&
+        response.service_id == 0x72 &&
+        response.data_len == 0 &&
+        kwp_frame_checksum_valid(&response);
     if (!wakeup_ack_valid) {
-        kwp_log_received_frame("Invalid wake-up ACK", &wakeup_response);
+        kwp_log_received_frame("Invalid wake-up ACK", &response);
         kwp_diagnostic_timing_stop();
         return false;
     }
+    ESP_LOGI(TAG, "Wake-up ACK validated");
 
-    vTaskDelay(pdMS_TO_TICKS(KWP_POST_WAKEUP_READ_DELAY_MS));
-
-    // Kirim Session Init 72 05 71 00 18
-    const uint8_t init_frame[] = {0x72, 0x05, 0x71, 0x00, 0x18};
+    const uint8_t session_request[] = {0x72, 0x05, 0x00, 0xF0, 0x99};
     int64_t session_tx_start_us = esp_timer_get_time();
-    if (!kwp2000_send_bytes(init_frame, sizeof(init_frame))) {
+    if (!kwp2000_send_bytes(session_request, sizeof(session_request))) {
+        kwp_diagnostic_timing_stop();
+        return false;
+    }
+    response_received = kwp2000_receive_frame(&response, KWP_INIT_RESPONSE_TIMEOUT_MS);
+    int64_t session_wait_end_us = esp_timer_get_time();
+    kwp_log_rx_exchange_summary(session_request, sizeof(session_request),
+                                session_tx_start_us, session_wait_end_us);
+    bool session_ack_valid =
+        response_received &&
+        response.target_address == 0x02 &&
+        response.length == 4 &&
+        response.service_id == 0x00 &&
+        response.data_len == 0 &&
+        kwp_frame_checksum_valid(&response);
+    if (!session_ack_valid) {
+        if (response_received) {
+            kwp_log_received_frame("Invalid session ACK", &response);
+        } else {
+            ESP_LOGW(TAG, "Session ACK timeout after request 72 05 00 F0 99");
+        }
+        kwp_diagnostic_timing_stop();
+        return false;
+    }
+    ESP_LOGI(TAG, "Session ACK 02 04 00 FA validated");
+
+    const uint8_t model_id_request[] = {0x7E, 0x06, 0x01, 0x01, 0x00, 0x7A};
+    int64_t model_tx_start_us = esp_timer_get_time();
+    if (!kwp2000_send_bytes(model_id_request, sizeof(model_id_request))) {
+        kwp_diagnostic_timing_stop();
+        return false;
+    }
+    response_received = kwp2000_receive_frame(&response, KWP_INIT_RESPONSE_TIMEOUT_MS);
+    int64_t model_wait_end_us = esp_timer_get_time();
+    kwp_log_rx_exchange_summary(model_id_request, sizeof(model_id_request),
+                                model_tx_start_us, model_wait_end_us);
+
+    static const uint8_t expected_part_prefix[] = "38770-";
+    char received_part_number[14] = {0};
+    bool part_number_available =
+        response_received && response.data_len >= 14 &&
+        response.data[0] == 0x01;
+    if (part_number_available) {
+        memcpy(received_part_number, &response.data[1], 13);
+        received_part_number[13] = '\0';
+    }
+    bool model_id_valid =
+        response_received &&
+        response.target_address == 0x02 &&
+        response.length == 18 &&
+        response.service_id == 0x01 &&
+        response.data_len == 14 &&
+        response.data[0] == 0x01 &&
+        memcmp(&response.data[1], expected_part_prefix,
+               sizeof(expected_part_prefix) - 1) == 0 &&
+        kwp_frame_checksum_valid(&response);
+    if (!model_id_valid) {
+        if (response_received) {
+            kwp_log_received_frame("Invalid model ID response", &response);
+        } else {
+            ESP_LOGW(TAG, "Model ID response timeout after request 7E 06 01 01 00 7A");
+        }
         kwp_diagnostic_timing_stop();
         return false;
     }
 
-    kwp2000_frame_t session_response;
-    bool session_ack = kwp2000_receive_frame(&session_response, KWP_RESPONSE_TIMEOUT_MS);
-    kwp_log_rx_exchange_summary(init_frame, sizeof(init_frame),
-                                session_tx_start_us, esp_timer_get_time());
-
-    bool session_ack_valid =
-        session_ack &&
-        (session_response.target_address == 0x0E ||
-         session_response.target_address == 0x02) &&
-        session_response.length == 5 &&
-        session_response.service_id == 0x71 &&
-        session_response.data_len >= 1 &&
-        session_response.data[0] == 0x00 &&
-        kwp_frame_checksum_valid(&session_response);
-    if (session_ack_valid) {
-        kwp_session_established = true;
-        ESP_LOGI(TAG, "K-Line Diagnostic Session Established Successfully!");
-        ESP_LOGI(TAG, "TIMING diagnostic sequence completed at +%lld us",
-                 (long long)kwp_diagnostic_elapsed_us());
-        kwp_diagnostic_timing_stop();
-        return true;
-    }
-
-    if (session_ack) {
-        kwp_log_received_frame("Invalid session ACK", &session_response);
-    } else {
-        ESP_LOGW(TAG, "No valid session ACK frame; raw RX bytes are shown in the exchange summary above");
-    }
-    ESP_LOGW(TAG, "TIMING session response missing/invalid at +%lld us",
+    ESP_LOGI(TAG, "ECU model ID validated: %s", received_part_number);
+    kwp_session_established = true;
+    ESP_LOGI(TAG, "K-Line Diagnostic Session Established Successfully!");
+    ESP_LOGI(TAG, "TIMING diagnostic sequence completed at +%lld us",
              (long long)kwp_diagnostic_elapsed_us());
     kwp_diagnostic_timing_stop();
-    return false;
+    return true;
 }
 
 bool kwp2000_send_frame(kwp2000_frame_t *frame)

@@ -42,8 +42,8 @@ static vprintf_like_t web_log_previous_vprintf = NULL;
 static bool diagnostic_request_active = false;
 static kwp_init_params_t diagnostic_request_params = {
     .idle_ms = 3000,
-    .low_ms = 25,
-    .high_ms = 25,
+    .low_ms = 70,
+    .high_ms = 120,
     .w4_us = 0,
     .byte_gap_us = 0,
 };
@@ -171,8 +171,8 @@ static const char *dashboard_html = R"html(
     Start K-Line Communication
   </button>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
-    <label>LOW (ms) <input id="initLow" type="number" min="10" max="110" value="25" style="width:70px;"></label>
-    <label>HIGH (ms) <input id="initHigh" type="number" min="10" max="200" value="25" style="width:70px;"></label>
+    <label>LOW (ms) <input id="initLow" type="number" min="10" max="110" value="70" style="width:70px;"></label>
+    <label>HIGH (ms) <input id="initHigh" type="number" min="10" max="200" value="120" style="width:70px;"></label>
     <label>W4 (us) <input id="initW4" type="number" min="0" max="50000" value="0" style="width:80px;"></label>
     <label>Byte gap (us) <input id="initGap" type="number" min="0" max="5000" value="0" style="width:80px;"></label>
   </div>
@@ -257,7 +257,8 @@ static const char *dashboard_html = R"html(
         message.textContent = data.message || (data.success
           ? 'K-Line communication started' : 'K-Line initialization failed');
       } catch (error) {
-        message.textContent = 'Request failed';
+        message.textContent = 'Request failed: ' +
+          (error instanceof Error ? error.message : String(error));
       } finally {
         button.disabled = false;
       }
@@ -428,8 +429,8 @@ static esp_err_t start_diagnostic_handler(httpd_req_t *req)
 {
     kwp_init_params_t requested_params = {
         .idle_ms = 3000,
-        .low_ms = 25,
-        .high_ms = 25,
+        .low_ms = 70,
+        .high_ms = 120,
         .w4_us = 0,
         .byte_gap_us = 0,
     };
@@ -751,8 +752,8 @@ static void queue_consumer_task(void *arg)
 {
     ecu_status_t status;
     while (1) {
-        if (xQueueReceive(ecu_queue, &status, pdMS_TO_TICKS(200)) == pdTRUE) {
-            if (status_mutex && xSemaphoreTake(status_mutex, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(ecu_queue, &status, portMAX_DELAY) == pdTRUE) {
+            if (status_mutex && xSemaphoreTake(status_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 current_status = status;
                 current_status.sd_card_available = sd_logger_is_available();
                 xSemaphoreGive(status_mutex);
@@ -765,7 +766,6 @@ static void queue_consumer_task(void *arg)
                                      status.coolant_temp_c,
                                      status.dtc_count);
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -777,6 +777,7 @@ void app_test_kwp2000(void *arg)
 
     ecu_status_t status;
     memset(&status, 0, sizeof(status));
+    int consecutive_failures = 0;
 
     while (1) {
         if (diagnostic_request_sem != NULL &&
@@ -805,10 +806,13 @@ void app_test_kwp2000(void *arg)
                          (unsigned long)requested_params.byte_gap_us);
                 bool success = kwp2000_begin_diagnostic_session(0x81,
                                                                  &requested_params);
+                ESP_LOGI(TAG, "KWP task stack high-water mark after diagnostic session: %u bytes",
+                         (unsigned)uxTaskGetStackHighWaterMark(NULL));
                 if (success) {
+                    consecutive_failures = 0;
                     ESP_LOGI(TAG, "K-Line Session Initialized Successfully");
                 } else {
-                    ESP_LOGW(TAG, "K-Line Fast Init Failed");
+                    ESP_LOGW(TAG, "K-Line initialization sequence failed or ECU session was not confirmed");
                 }
                 xSemaphoreGive(kwp_mutex);
             } else {
@@ -842,28 +846,49 @@ void app_test_kwp2000(void *arg)
             continue;
         }
 
-        static int consecutive_failures = 0;
+        static bool table_length_warning_logged = false;
 
         if (read_ok) {
-            if (table_len < 12) {
+            if (table_len != 22 && !table_length_warning_logged) {
+                ESP_LOGW(TAG,
+                         "Table 0x10 payload length is %u bytes; expected 22",
+                         (unsigned)table_len);
+                table_length_warning_logged = true;
+            }
+            if (table_len < 15) {
                 status.ecu_connected = false;
                 snprintf(status.status_text, sizeof(status.status_text), "invalid table 0x10");
-                xQueueSend(ecu_queue, &status, portMAX_DELAY);
+                xQueueSend(ecu_queue, &status, 0);
                 vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
 
             consecutive_failures = 0;
             status.ecu_connected = true;
-            status.tps_percent_tenths = (uint16_t)table_data[2] * 5;
-            status.rpm = ((uint16_t)table_data[3] << 8) | table_data[4];
-            status.coolant_temp_c = (int16_t)table_data[5] - 40;
-            status.map_kpa_quarters = (uint16_t)table_data[8] * 3;
-            status.speed_kph = table_data[11];
+            // Decode data sensor Table 10 sesuai formula resmi Analist Pro (Method 0x0600013d):
+            // table_data[0]  = Table ID (0x10)
+            // table_data[1..2] = RPM (MSB, LSB)
+            // table_data[3]  = TPS Volt (raw * 5.0 / 256.0 V)
+            // table_data[4]  = TPS % (raw / 2.0 %) -> * 5 untuk tenths of percent (0.1%)
+            // table_data[5]  = ECT Volt
+            // table_data[6]  = ECT Temp (raw - 40 deg C)
+            // table_data[7]  = IAT Volt
+            // table_data[8]  = IAT Temp (raw - 40 deg C)
+            // table_data[9]  = MAP Volt
+            // table_data[10] = MAP Pressure (raw kPa) -> * 4 untuk quarters of kPa
+            // table_data[13] = Battery Volt (raw / 10.0 V)
+            // table_data[14] = Vehicle Speed (km/h)
+            // table_data[15..16] = Injector Duration (((rawMSB<<8)|rawLSB) / 200.0 ms)
+            // table_data[17] = Ignition Timing ((raw / 2.0) - 64.0 deg BTDC)
+            status.rpm = ((uint16_t)table_data[1] << 8) | table_data[2];
+            status.tps_percent_tenths = (uint16_t)table_data[4] * 5;
+            status.coolant_temp_c = (int16_t)table_data[6] - 40;
+            status.map_kpa_quarters = (uint16_t)table_data[10] * 4;
+            status.speed_kph = table_data[14];
             status.dtc_count = 0;
             snprintf(status.status_text, sizeof(status.status_text), "ecu ok");
             status.timestamp_ms = esp_timer_get_time() / 1000ULL;
-            xQueueSend(ecu_queue, &status, portMAX_DELAY);
+            xQueueSend(ecu_queue, &status, 0);
         } else {
             consecutive_failures++;
             if (consecutive_failures >= 10) {
@@ -875,7 +900,7 @@ void app_test_kwp2000(void *arg)
             }
             status.ecu_connected = false;
             snprintf(status.status_text, sizeof(status.status_text), "waiting");
-            xQueueSend(ecu_queue, &status, portMAX_DELAY);
+            xQueueSend(ecu_queue, &status, 0);
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -925,7 +950,7 @@ extern "C" void app_main(void)
     BaseType_t queue_task_result = xTaskCreatePinnedToCore(
         queue_consumer_task, "queue_consumer", 4096, NULL, 5, NULL, 1);
     BaseType_t kwp_task_result = xTaskCreatePinnedToCore(
-        app_test_kwp2000, "test_kwp2000", 4096, NULL, 5, NULL, 1);
+        app_test_kwp2000, "test_kwp2000", 8192, NULL, 5, NULL, 1);
     if (queue_task_result != pdPASS || kwp_task_result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create application task(s): queue=%d KWP=%d",
                  (int)queue_task_result, (int)kwp_task_result);

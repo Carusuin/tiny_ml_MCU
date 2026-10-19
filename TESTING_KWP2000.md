@@ -5,26 +5,39 @@ Ini adalah setup untuk test komunikasi KWP2000 antara ESP32 dan ECU emulator (Py
 
 ## Profil timing dan pemetaan sensor (uji AGY)
 
-Firmware saat ini menghasilkan Fast Init dengan UART tetap tersambung ke TX:
-parameter timing bisa diubah dari input dashboard atau query POST
-`/api/start-diagnostic?low=25&high=25&w4=0&gap=0&idle=3000`. Nilai default
-adalah idle 3000 ms, LOW 25 ms, HIGH 25 ms, W4 0 us, dan byte gap 0 us.
+Firmware menjalankan Fast Init melalui UART yang tetap tersambung ke TX.
+Parameter timing dapat diubah dari input dashboard atau query POST
+`/api/start-diagnostic?low=70&high=120&w4=0&gap=0&idle=3000`. Nilai default
+adalah idle 3000 ms, LOW 70 ms, HIGH 120 ms, W4 0 us, dan byte gap 0 us.
 Endpoint menolak nilai di luar rentang LOW 10-110 ms, HIGH 10-200 ms,
 W4 0-50000 us, gap 0-5000 us, dan idle 300-5000 ms. Baud Fast Init dihitung
-dari durasi LOW (target 360 baud pada 25 ms) untuk mengirim satu frame `0x00`
-(start bit + 8 bit data, LOW sekitar 25 ms), lalu menahan idle HIGH sesuai
-parameter. Baud aktual dibaca, dicatat, dan Fast Init dibatalkan jika selisih
+dari durasi LOW (target sekitar 129 baud pada 70 ms) untuk mengirim satu frame
+`0x00` (start bit + 8 bit data, LOW sekitar 70 ms), lalu menahan idle HIGH sesuai
+parameter. `0x00` tersebut hanya pola UART untuk membentuk pulsa fisik Fast Init,
+bukan byte preamble KWP; `0x01` mandiri dari capture FTDI juga tidak dikirim.
+Baud aktual dibaca, dicatat, dan Fast Init dibatalkan jika selisih
 target melebihi 2%; setelah pulsa UART kembali ke 10400 baud. W4 tambahan
 default 0 us karena fase HIGH sudah dilaksanakan di Fast Init; wake-up
 `FE 04 72 8C` dikirim setelah pembersihan RX.
 UART tetap 8N1 dengan `KLINE_TX_INVERTING=1` dan `KLINE_RX_INVERTING=1` untuk
 rangkaian NPN inverting saat ini; TX tidak dipetakan ulang selama urutan init.
-Timeout
-respons 120 ms dan TX tanpa jeda antar-byte yang dikonfigurasi. ACK wake-up
-harus memiliki target `0x0E` atau `0x02`, panjang 4, dan checksum valid. ACK
-sesi harus memiliki panjang 5, service `0x71`, dan data pertama `0x00`. Dua
-varian yang dilaporkan AGY (`0E 04 72` tanpa checksum dan `72 8C`) belum
-diterima oleh parser saat ini.
+Setelah Fast Init firmware mengikuti pertukaran di `HONDA_K15_KLINE_PROTOCOL.md`:
+`FE 04 72 8C` → ACK `0E 04 72 7C`, request sesi `72 05 00 F0 99` →
+ACK `02 04 00 FA`, lalu query model `7E 06 01 01 00 7A` dan validasi model ID
+berawalan `38770-K15-` (13 byte ID dicatat di log) sebelum menandai sesi established.
+Byte `01` mandiri dan frame
+`7E...` tidak lagi dikirim sebelum sesi; query `7E...` hanya dikirim setelah
+ACK sesi valid. Sesudah sesi terkonfirmasi, task membaca Table `0x10` seperti
+sebelumnya. Payload Table 10 dipetakan dari `frame[i+3]` ke `table_data[i]`;
+MAP memakai `table_data[9]` dan speed memakai `table_data[14]`. Panjang 22 byte
+diharapkan; payload di bawah 15 byte ditolak karena field yang dipakai tidak lengkap.
+Setiap respons harus lolos validasi panjang dan checksum.
+Saat mengecek timing, `HIGH-end->wake-up` di log harus minimal sebesar W4 yang
+diminta; dengan W4 0 us targetnya di bawah 2000 us. Tidak ada log yang dicetak
+di antara akhir fase HIGH dan pemanggilan TX wake-up. Laporan RX cleanup dan
+baud/Fast Init dicetak setelah wake-up dikirim. Setelah tiap usaha sesi,
+high-water mark stack task KWP juga dicatat dalam byte.
+Byte gap dalam frame dikendalikan oleh parameter `gap` dan default-nya nol.
 Parser RX berjalan per byte dan mempertahankan `0xFE` kedua jika ada beberapa
 `0xFE` berturut-turut, sehingga header wake-up berikutnya tetap dapat
 diselaraskan. Echo hanya dibuang jika seluruh frame cocok dengan TX.
@@ -38,7 +51,7 @@ satu percobaan agar echo dan respons percobaan itu mudah dibedakan. Byte yang
 sudah berada di buffer driver sebelum buffer dibersihkan juga direkam. Byte yang
 hilang karena overflow hardware/UART tidak dapat dipulihkan oleh firmware.
 Serial Monitor menampilkan baris `TIMING` untuk durasi idle, pulsa LOW/HIGH,
-baud target/aktual, W4, pengiriman wake-up, dan ringkasan RX per-exchange.
+baud target/aktual, W4, offset pengiriman tiap kelompok, dan ringkasan RX.
 Timestamp RX adalah waktu task membaca byte dari driver UART, bukan waktu tepi
 sinyal yang diukur langsung pada bus. RX task dijeda selama Fast Init tanpa
 mengalihkan pin RX UART. Setelah pulsa, firmware mencatat jumlah byte yang
