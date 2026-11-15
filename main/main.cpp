@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,13 +26,13 @@ static const char *TAG = "APP_MAIN";
 
 #define WEB_LOG_LINE_COUNT 128
 #define WEB_LOG_LINE_SIZE 256
+#define KWP_POLL_INTERVAL_US 100000LL
 
 static char web_log_lines[WEB_LOG_LINE_COUNT][WEB_LOG_LINE_SIZE];
 static size_t web_log_line_capacity = 64;
 static size_t web_log_count = 0;
 static size_t web_log_next = 0;
 
-// Gunakan Mutex untuk log buffer & status (bukan Critical Section)
 static SemaphoreHandle_t web_log_mutex = NULL;
 static SemaphoreHandle_t status_mutex = NULL;
 static SemaphoreHandle_t kwp_mutex = NULL;
@@ -40,10 +41,17 @@ static SemaphoreHandle_t diagnostic_state_mutex = NULL;
 
 static vprintf_like_t web_log_previous_vprintf = NULL;
 static bool diagnostic_request_active = false;
+static bool diagnostic_polling_enabled = false;
+static bool diagnostic_session_ready = false;
+// Timing HondaECU Lite Kline Edition (terkonfirmasi langsung dari binary):
+//   idle_ms     = 3000 → bus HIGH sebelum init
+//   low_ms      = 70   → pulsa LOW wake-up (0.07s di binary)
+//   high_ms     = 130  → waktu HIGH stabilisasi sebelum frame wake-up FE 04 72 8C (0.13s di binary)
+//   byte_gap_us = 0    → jeda antar byte dalam satu frame (kontinu)
 static kwp_init_params_t diagnostic_request_params = {
     .idle_ms = 3000,
     .low_ms = 70,
-    .high_ms = 120,
+    .high_ms = 130,
     .w4_us = 0,
     .byte_gap_us = 0,
 };
@@ -168,11 +176,15 @@ static const char *dashboard_html = R"html(
     <div id="sdState" class="warn">Checking...</div>
   </div>
   <button id="initButton" onclick="startDiagnostic()" style="margin-top:20px;padding:12px 18px;">
-    Start K-Line Communication
+    Connect ECU
+  </button>
+  <button id="diagnosisButton" onclick="toggleDiagnosis()"
+          style="margin-top:20px;padding:12px 18px;">
+    Start Diagnosis
   </button>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
-    <label>LOW (ms) <input id="initLow" type="number" min="10" max="110" value="70" style="width:70px;"></label>
-    <label>HIGH (ms) <input id="initHigh" type="number" min="10" max="200" value="120" style="width:70px;"></label>
+    <label>LOW (ms) <input id="initLow" type="number" min="0" max="110" value="70" style="width:70px;"></label>
+    <label>HIGH (ms) <input id="initHigh" type="number" min="10" max="300" value="130" style="width:70px;"></label>
     <label>W4 (us) <input id="initW4" type="number" min="0" max="50000" value="0" style="width:80px;"></label>
     <label>Byte gap (us) <input id="initGap" type="number" min="0" max="5000" value="0" style="width:80px;"></label>
   </div>
@@ -218,8 +230,14 @@ static const char *dashboard_html = R"html(
         sd.textContent = data.sd_card_available ? 'SD card ready' : 'SD card not detected';
         sd.className = data.sd_card_available ? 'status' : 'warn';
         const state = document.getElementById('state');
-        state.textContent = data.ecu_connected ? 'ECU connected' : 'Waiting for ECU';
-        state.className = data.ecu_connected ? 'status' : 'warn';
+        state.textContent = data.ecu_connected ? 'ECU connected' :
+          (data.session_initialized ? 'ECU session ready' : 'Waiting for ECU');
+        state.className = data.ecu_connected || data.session_initialized
+          ? 'status' : 'warn';
+        const diagnosisButton = document.getElementById('diagnosisButton');
+        diagnosisButton.textContent = data.diagnosis_active
+          ? 'Stop Diagnosis' : 'Start Diagnosis';
+        diagnosisButton.disabled = false;
       } catch (error) {
         document.getElementById('state').textContent = 'Error';
         document.getElementById('state').className = 'bad';
@@ -261,6 +279,24 @@ static const char *dashboard_html = R"html(
           (error instanceof Error ? error.message : String(error));
       } finally {
         button.disabled = false;
+      }
+    }
+    async function toggleDiagnosis() {
+      const button = document.getElementById('diagnosisButton');
+      const message = document.getElementById('initMessage');
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/diagnosis/toggle', { method: 'POST' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || 'Diagnosis request failed');
+        message.textContent = data.message;
+        await loadStatus();
+      } catch (error) {
+        message.textContent = 'Diagnosis request failed: ' +
+          (error instanceof Error ? error.message : String(error));
+      } finally {
+        button.disabled = false;
+        await loadStatus();
       }
     }
     async function loadLogs() {
@@ -311,7 +347,7 @@ static const char *dashboard_html = R"html(
         data.success ? 'TX released' : data.error;
     }
     loadStatus(); loadDtc(); loadLogs(); loadRxBytes();
-    setInterval(loadStatus, 1000);
+    setInterval(loadStatus, 200);
     setInterval(loadDtc, 3000);
     setInterval(loadLogs, 500);
     setInterval(loadRxBytes, 500);
@@ -335,7 +371,7 @@ static const httpd_uri_t uri_root = {
 
 static esp_err_t status_json_handler(httpd_req_t *req)
 {
-    char json[320];
+    char json[384];
     ecu_status_t snapshot_status;
 
     if (status_mutex == NULL ||
@@ -347,9 +383,21 @@ static esp_err_t status_json_handler(httpd_req_t *req)
     snapshot_status = current_status;
     xSemaphoreGive(status_mutex);
 
+    if (diagnostic_state_mutex == NULL ||
+        xSemaphoreTake(diagnostic_state_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Diagnosis status lock busy");
+        return ESP_FAIL;
+    }
+    bool session_initialized = diagnostic_session_ready;
+    bool diagnosis_active = diagnostic_polling_enabled;
+    xSemaphoreGive(diagnostic_state_mutex);
+
     snprintf(json, sizeof(json),
-        "{\"ecu_connected\":%s,\"rpm\":%u,\"speed_kph\":%u,\"coolant_temp_c\":%d,\"tps_percent_tenths\":%u,\"map_kpa_quarters\":%u,\"dtc_count\":%u,\"status_text\":\"%s\",\"sd_card_available\":%s}",
+        "{\"ecu_connected\":%s,\"session_initialized\":%s,\"diagnosis_active\":%s,\"rpm\":%u,\"speed_kph\":%u,\"coolant_temp_c\":%d,\"tps_percent_tenths\":%u,\"map_kpa_quarters\":%u,\"dtc_count\":%u,\"status_text\":\"%s\",\"sd_card_available\":%s}",
         snapshot_status.ecu_connected ? "true" : "false",
+        session_initialized ? "true" : "false",
+        diagnosis_active ? "true" : "false",
         (unsigned)snapshot_status.rpm,
         (unsigned)snapshot_status.speed_kph,
         (int)snapshot_status.coolant_temp_c,
@@ -399,7 +447,6 @@ static const httpd_uri_t uri_dtc = {
     .user_ctx = NULL,
 };
 
-// Handler start diagnostic menjadi Asynchronous agar tidak memblokir HTTP Server
 static bool parse_timing_query_value(const char *query,
                                      const char *key,
                                      uint32_t minimum,
@@ -430,7 +477,7 @@ static esp_err_t start_diagnostic_handler(httpd_req_t *req)
     kwp_init_params_t requested_params = {
         .idle_ms = 3000,
         .low_ms = 70,
-        .high_ms = 120,
+        .high_ms = 130,
         .w4_us = 0,
         .byte_gap_us = 0,
     };
@@ -444,8 +491,8 @@ static esp_err_t start_diagnostic_handler(httpd_req_t *req)
         return ESP_OK;
     }
     if (query_err == ESP_OK &&
-        (!parse_timing_query_value(query, "low", 10, 110, &requested_params.low_ms) ||
-         !parse_timing_query_value(query, "high", 10, 200, &requested_params.high_ms) ||
+        (!parse_timing_query_value(query, "low", 0, 110, &requested_params.low_ms) ||
+         !parse_timing_query_value(query, "high", 10, 300, &requested_params.high_ms) ||
          !parse_timing_query_value(query, "w4", 0, 50000, &requested_params.w4_us) ||
          !parse_timing_query_value(query, "gap", 0, 5000, &requested_params.byte_gap_us) ||
          !parse_timing_query_value(query, "idle", 300, 5000, &requested_params.idle_ms))) {
@@ -473,6 +520,8 @@ static esp_err_t start_diagnostic_handler(httpd_req_t *req)
     }
 
     diagnostic_request_active = true;
+    diagnostic_polling_enabled = false;
+    diagnostic_session_ready = false;
     diagnostic_request_params = requested_params;
     BaseType_t request_queued = xSemaphoreGive(diagnostic_request_sem);
     if (request_queued != pdTRUE) {
@@ -490,6 +539,45 @@ static esp_err_t start_diagnostic_handler(httpd_req_t *req)
     httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"Init request sent\"}");
     return ESP_OK;
 }
+
+static esp_err_t toggle_diagnosis_handler(httpd_req_t *req)
+{
+    if (diagnostic_state_mutex == NULL ||
+        xSemaphoreTake(diagnostic_state_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Diagnosis state lock busy");
+        return ESP_FAIL;
+    }
+
+    // Izinkan diagnosis dimulai kapan saja (tidak diblokir jika belum connect)
+    if (!diagnostic_polling_enabled && diagnostic_request_active) {
+        xSemaphoreGive(diagnostic_state_mutex);
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req,
+                           "{\"success\":false,\"message\":\"Wait for connection sequence to complete\"}");
+        return ESP_OK;
+    }
+
+    diagnostic_polling_enabled = !diagnostic_polling_enabled;
+    bool enabled = diagnostic_polling_enabled;
+    xSemaphoreGive(diagnostic_state_mutex);
+
+    ESP_LOGI(TAG, "Dashboard %s repeated diagnostic polling",
+             enabled ? "started" : "stopped");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, enabled
+        ? "{\"success\":true,\"active\":true,\"message\":\"Diagnosis started; polling immediately\"}"
+        : "{\"success\":true,\"active\":false,\"message\":\"Diagnosis stopped\"}");
+    return ESP_OK;
+}
+
+static const httpd_uri_t uri_toggle_diagnosis = {
+    .uri = "/api/diagnosis/toggle",
+    .method = HTTP_POST,
+    .handler = toggle_diagnosis_handler,
+    .user_ctx = NULL,
+};
 
 static const httpd_uri_t uri_start_diagnostic = {
     .uri = "/api/start-diagnostic",
@@ -550,7 +638,6 @@ static const httpd_uri_t uri_tx_test_stop = {
     .user_ctx = (void *)"stop",
 };
 
-// Log handler aman tanpa mematikan interrupt CPU
 static esp_err_t logs_json_handler(httpd_req_t *req)
 {
     if (web_log_mutex == NULL || xSemaphoreTake(web_log_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
@@ -738,6 +825,7 @@ static void start_webserver(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_status));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_dtc));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_start_diagnostic));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_toggle_diagnosis));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_tx_test_high));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_tx_test_low));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_tx_test_stop));
@@ -769,7 +857,6 @@ static void queue_consumer_task(void *arg)
     }
 }
 
-// Task KWP2000 terpusat (Mengelola Init & Sampling Data)
 void app_test_kwp2000(void *arg)
 {
     ESP_LOGI(TAG, "Test KWP2000 task started on core %d", xPortGetCoreID());
@@ -777,7 +864,14 @@ void app_test_kwp2000(void *arg)
 
     ecu_status_t status;
     memset(&status, 0, sizeof(status));
-    int consecutive_failures = 0;
+    uint32_t consecutive_failures = 0;
+    static const uint8_t diagnostic_tables[] = {
+        0x10
+    };
+    size_t diagnostic_table_index = 0;
+    int64_t next_poll_time_us = 0;
+    int64_t next_keep_alive_time_us = 0;
+    bool previous_polling_enabled = false;
 
     while (1) {
         if (diagnostic_request_sem != NULL &&
@@ -786,6 +880,7 @@ void app_test_kwp2000(void *arg)
 
             kwp_init_params_t requested_params = {};
             bool params_ready = false;
+            bool init_succeeded = false;
             if (diagnostic_state_mutex != NULL &&
                 xSemaphoreTake(diagnostic_state_mutex, portMAX_DELAY) == pdTRUE) {
                 requested_params = diagnostic_request_params;
@@ -806,13 +901,22 @@ void app_test_kwp2000(void *arg)
                          (unsigned long)requested_params.byte_gap_us);
                 bool success = kwp2000_begin_diagnostic_session(0x81,
                                                                  &requested_params);
+                init_succeeded = success;
                 ESP_LOGI(TAG, "KWP task stack high-water mark after diagnostic session: %u bytes",
                          (unsigned)uxTaskGetStackHighWaterMark(NULL));
                 if (success) {
                     consecutive_failures = 0;
-                    ESP_LOGI(TAG, "K-Line Session Initialized Successfully");
+                    diagnostic_table_index = 0;
+                    next_poll_time_us = 0;
+                    ESP_LOGI(TAG, "K-Line initialization TX complete");
                 } else {
-                    ESP_LOGW(TAG, "K-Line initialization sequence failed or ECU session was not confirmed");
+                    next_poll_time_us = 0;
+                    ESP_LOGW(TAG, "K-Line TX sequence failed");
+                    status.ecu_connected = false;
+                    snprintf(status.status_text, sizeof(status.status_text),
+                             "ECU handshake failed");
+                    status.timestamp_ms = esp_timer_get_time() / 1000ULL;
+                    xQueueSend(ecu_queue, &status, 0);
                 }
                 xSemaphoreGive(kwp_mutex);
             } else {
@@ -822,88 +926,160 @@ void app_test_kwp2000(void *arg)
             if (diagnostic_state_mutex != NULL &&
                 xSemaphoreTake(diagnostic_state_mutex, portMAX_DELAY) == pdTRUE) {
                 diagnostic_request_active = false;
+                diagnostic_session_ready = init_succeeded;
+                diagnostic_polling_enabled = false;
                 xSemaphoreGive(diagnostic_state_mutex);
+                if (init_succeeded) {
+                    ESP_LOGI(TAG, "Initialization OK -> Standby ready. User can press Start Diagnosis.");
+                    next_keep_alive_time_us = esp_timer_get_time() + 1000000LL;
+                }
             }
         }
+
+        bool polling_enabled = false;
+        if (diagnostic_state_mutex == NULL ||
+            xSemaphoreTake(diagnostic_state_mutex, portMAX_DELAY) != pdTRUE) {
+            ESP_LOGE(TAG, "Unable to read diagnostic polling state");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        polling_enabled = diagnostic_polling_enabled;
+        xSemaphoreGive(diagnostic_state_mutex);
+
+        if (!polling_enabled) {
+            previous_polling_enabled = false;
+            next_poll_time_us = 0;
+            diagnostic_table_index = 0;
+
+            // Heartbeat Keep-Alive: Jika sesi ECU terhubung tetapi user belum memulai live data,
+            // kirim frame keep-alive setiap 1.5 detik agar ECU Keihin tidak timeout / tidur.
+            bool session_ready = false;
+            if (diagnostic_state_mutex != NULL &&
+                xSemaphoreTake(diagnostic_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                session_ready = diagnostic_session_ready;
+                xSemaphoreGive(diagnostic_state_mutex);
+            }
+
+            if (session_ready) {
+                int64_t now_us = esp_timer_get_time();
+                if (now_us >= next_keep_alive_time_us) {
+                    if (kwp_mutex != NULL &&
+                        xSemaphoreTake(kwp_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                        bool alive_ok = kwp2000_send_keep_alive();
+                        xSemaphoreGive(kwp_mutex);
+                        if (alive_ok) {
+                            status.ecu_connected = true;
+                            snprintf(status.status_text, sizeof(status.status_text), "standby keep-alive ok");
+                            status.timestamp_ms = esp_timer_get_time() / 1000ULL;
+                            xQueueSend(ecu_queue, &status, 0);
+                        } else {
+                            ESP_LOGW(TAG, "Keep-alive missed; retrying next cycle");
+                        }
+                    }
+                    next_keep_alive_time_us = esp_timer_get_time() + 1500000LL;
+                }
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (!previous_polling_enabled) {
+            previous_polling_enabled = true;
+            diagnostic_table_index = 0;
+            next_poll_time_us = esp_timer_get_time();
+            ESP_LOGI(TAG,
+                     "Diagnosis started; first table request is being sent now");
+        }
+
+        int64_t poll_wait_us = next_poll_time_us - esp_timer_get_time();
+        if (poll_wait_us > 0) {
+            int64_t wait_ms = (poll_wait_us + 999) / 1000;
+            if (wait_ms > 50) {
+                wait_ms = 50;
+            }
+            TickType_t poll_wait_ticks = pdMS_TO_TICKS(wait_ms);
+            vTaskDelay(poll_wait_ticks > 0 ? poll_wait_ticks : 1);
+            continue;
+        }
+        next_poll_time_us = 0;
 
         uint8_t table_data[64];
         uint8_t table_len = 0;
         bool read_ok = false;
-        bool session_initialized = false;
+        bool kwp_lock_acquired = false;
+        uint8_t table_id = diagnostic_tables[diagnostic_table_index];
+        diagnostic_table_index =
+            (diagnostic_table_index + 1) %
+            (sizeof(diagnostic_tables) / sizeof(diagnostic_tables[0]));
 
         if (kwp_mutex != NULL &&
             xSemaphoreTake(kwp_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-            session_initialized = kwp2000_is_initialized();
-            if (session_initialized) {
-                read_ok = kwp2000_read_data_by_id(
-                    0x10, table_data, sizeof(table_data), &table_len);
-            }
+            kwp_lock_acquired = true;
+
+            ESP_LOGI(TAG, "Diagnosis poll requesting table 0x%02X",
+                     table_id);
+            read_ok = kwp2000_read_data_by_id(
+                table_id, table_data, sizeof(table_data), &table_len);
+
             xSemaphoreGive(kwp_mutex);
         }
 
-        if (!session_initialized) {
-            vTaskDelay(pdMS_TO_TICKS(200));
+        if (!kwp_lock_acquired) {
+            ESP_LOGW(TAG, "KWP mutex busy; retrying table 0x%02X next cycle",
+                     table_id);
+            next_poll_time_us = esp_timer_get_time() + KWP_POLL_INTERVAL_US;
             continue;
         }
 
         static bool table_length_warning_logged = false;
 
         if (read_ok) {
-            if (table_len != 22 && !table_length_warning_logged) {
+            if (table_id == 0x10 && table_len != 22 &&
+                !table_length_warning_logged) {
                 ESP_LOGW(TAG,
                          "Table 0x10 payload length is %u bytes; expected 22",
                          (unsigned)table_len);
                 table_length_warning_logged = true;
             }
-            if (table_len < 15) {
-                status.ecu_connected = false;
+            if (table_id == 0x10 && table_len < 15) {
+                status.ecu_connected = true;
                 snprintf(status.status_text, sizeof(status.status_text), "invalid table 0x10");
                 xQueueSend(ecu_queue, &status, 0);
-                vTaskDelay(pdMS_TO_TICKS(100));
+                next_poll_time_us =
+                    esp_timer_get_time() + KWP_POLL_INTERVAL_US;
                 continue;
             }
 
             consecutive_failures = 0;
             status.ecu_connected = true;
-            // Decode data sensor Table 10 sesuai formula resmi Analist Pro (Method 0x0600013d):
-            // table_data[0]  = Table ID (0x10)
-            // table_data[1..2] = RPM (MSB, LSB)
-            // table_data[3]  = TPS Volt (raw * 5.0 / 256.0 V)
-            // table_data[4]  = TPS % (raw / 2.0 %) -> * 5 untuk tenths of percent (0.1%)
-            // table_data[5]  = ECT Volt
-            // table_data[6]  = ECT Temp (raw - 40 deg C)
-            // table_data[7]  = IAT Volt
-            // table_data[8]  = IAT Temp (raw - 40 deg C)
-            // table_data[9]  = MAP Volt
-            // table_data[10] = MAP Pressure (raw kPa) -> * 4 untuk quarters of kPa
-            // table_data[13] = Battery Volt (raw / 10.0 V)
-            // table_data[14] = Vehicle Speed (km/h)
-            // table_data[15..16] = Injector Duration (((rawMSB<<8)|rawLSB) / 200.0 ms)
-            // table_data[17] = Ignition Timing ((raw / 2.0) - 64.0 deg BTDC)
-            status.rpm = ((uint16_t)table_data[1] << 8) | table_data[2];
-            status.tps_percent_tenths = (uint16_t)table_data[4] * 5;
-            status.coolant_temp_c = (int16_t)table_data[6] - 40;
-            status.map_kpa_quarters = (uint16_t)table_data[10] * 4;
-            status.speed_kph = table_data[14];
+            if (table_id == 0x10) {
+                status.rpm = ((uint16_t)table_data[1] << 8) | table_data[2];
+                status.tps_percent_tenths = (uint16_t)table_data[4] * 5;
+                status.coolant_temp_c = (int16_t)table_data[6] - 40;
+                status.map_kpa_quarters = (uint16_t)table_data[9] * 3;
+                status.speed_kph = table_data[14];
+            }
             status.dtc_count = 0;
-            snprintf(status.status_text, sizeof(status.status_text), "ecu ok");
+            snprintf(status.status_text, sizeof(status.status_text),
+                     "ecu ok (table 0x%02X)", table_id);
             status.timestamp_ms = esp_timer_get_time() / 1000ULL;
             xQueueSend(ecu_queue, &status, 0);
         } else {
-            consecutive_failures++;
-            if (consecutive_failures >= 10) {
-                if (kwp_mutex != NULL && xSemaphoreTake(kwp_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    kwp2000_reset_session();
-                    xSemaphoreGive(kwp_mutex);
-                }
-                consecutive_failures = 0;
+            if (consecutive_failures < UINT32_MAX) {
+                consecutive_failures++;
             }
-            status.ecu_connected = false;
-            snprintf(status.status_text, sizeof(status.status_text), "waiting");
+            ESP_LOGW(TAG,
+                     "Table 0x%02X transaction failed (%lu consecutive); "
+                     "continuing diagnostic polling",
+                     table_id, (unsigned long)consecutive_failures);
+            status.ecu_connected = true;
+            snprintf(status.status_text, sizeof(status.status_text),
+                     "diag active; waiting");
             xQueueSend(ecu_queue, &status, 0);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        next_poll_time_us = esp_timer_get_time() + KWP_POLL_INTERVAL_US;
     }
 }
 
@@ -916,7 +1092,6 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    // Buat Mutex
     web_log_mutex = xSemaphoreCreateMutex();
     if (esp_get_free_heap_size() > 60 * 1024) {
         web_log_line_capacity = WEB_LOG_LINE_COUNT;
@@ -945,6 +1120,8 @@ extern "C" void app_main(void)
         current_status.sd_card_available = sd_ready;
         xSemaphoreGive(status_mutex);
     }
+
+    gpio_set_pull_mode((gpio_num_t)KLINE_RX_GPIO, GPIO_PULLUP_ONLY);
 
     kwp2000_init(KLINE_RX_GPIO, KLINE_TX_GPIO, KLINE_BAUDRATE);
     BaseType_t queue_task_result = xTaskCreatePinnedToCore(

@@ -37,29 +37,35 @@ sequenceDiagram
     MCU->>Bus: Tarik LOW selama 70 ms
     MCU->>Bus: Naikkan HIGH selama 120 ms
     Note over MCU: Buka UART pada 10,400 bps 8N1 & Purge Buffer
+    Note over MCU: TX berlanjut tanpa menunggu ACK; jeda antarkerangka sekitar 65 ms
 
     Note over MCU,ECU: TAHAP 2: Wake-Up Handshake Packet
     MCU->>Bus: Kirim [FE 04 72 8C]
-    Note over MCU: Buang 4 byte echo TX
     ECU-->>MCU: Balas Wake-Up ACK [0E 04 72 7C]
 
     Note over MCU,ECU: TAHAP 3: Inisialisasi Sesi Diagnostik
-    MCU->>Bus: Kirim Session Init [72 05 00 F0 99]
-    Note over MCU: Buang 5 byte echo TX
-    ECU-->>MCU: Balas Konfirmasi [02 04 00 FA]
+    loop Dua kali
+        MCU->>Bus: Session Init [72 05 00 F0 99]
+        ECU-->>MCU: Konfirmasi [02 04 00 FA]
+    end
 
-    Note over MCU,ECU: TAHAP 4: Identifikasi Model ID / Part ECU (CB150R Old)
-    MCU->>Bus: Request Model ID [7E 06 01 01 00 7A]
-    Note over MCU: Buang 6 byte echo TX
-    ECU-->>MCU: Balas Part Number [02 12 01 01 33 38 37 37 30 2D 4B 31 35 2D 39 30 33 3A] (18 Byte)
-    Note over MCU: Status Analist Pro: "ECU Connected" & "BASE Map tersedia."
+    Note over MCU,ECU: TAHAP 4: Identifikasi ROM dan Revisi Map
+    MCU->>Bus: Baca ROM ID [72 07 72 00 00 05 10]
+    ECU-->>MCU: Respons ROM ID
+    MCU->>Bus: Identifikasi revisi [7D 06 01 01 03 78]
+    ECU-->>MCU: ACK revisi 7D
+    MCU->>Bus: Identifikasi revisi [7B 06 02 01 03 79]
+    ECU-->>MCU: ACK revisi 7B
 
-    Note over MCU,ECU: TAHAP 5: Pembacaan Live Data Sensor (Looping)
-    loop Setiap 50ms - 100ms
-        MCU->>Bus: Request Table 10 [72 05 71 10 08]
-        Note over MCU: Buang 5 byte echo TX
-        ECU-->>MCU: Respon "Response dat10:" [02 1A 71 10 ... 21-byte sensor ... CS] (26 Byte)
-        Note over MCU: Decode RPM, TPS, ECT, MAP, V-Batt, Status Bitmask
+    Note over MCU,ECU: TAHAP 5: Polling Table Diagnostik
+    loop Table 11, 10, 13, 16, 17 berulang
+        opt Sebelum table setelah table pertama
+            MCU->>Bus: Housekeeping [72 05 71 20 F8]
+            MCU->>Bus: Housekeeping [72 05 71 D1 47]
+        end
+        MCU->>Bus: Request table [72 05 71 ID CS]
+        ECU-->>MCU: Respons table [02 ... 71 ID ... CS]
+        Note over MCU: Table 10: decode RPM, MAP, speed, dan sensor lain
     end
 ```
 
@@ -143,7 +149,11 @@ Mengunci ECU agar masuk ke mode diagnostik interaktif.
 
 ---
 
-### TAHAP 4: Query Model ID / Identifikasi Part (38770-K15-903)
+### TAHAP 4 (TRACE SEBELUMNYA): Query Model ID / Identifikasi Part (38770-K15-903)
+
+Bagian ini mendokumentasikan trace lama yang memuat request `7E`. Pada capture
+Analist Pro terbaru yang direplikasi firmware, request ini tidak dikirim; tahap
+identifikasi menggunakan ROM ID dan dua request revisi di atas.
 
 Setelah inisialisasi sesi berhasil (`02 04 00 FA`), Analist Pro langsung mengirim kueri identifikasi firmware/part model ECU via target address bootloader/flash service `0x7E`.
 
@@ -229,7 +239,11 @@ Setelah ECU merespon kueri awal, Analist Pro membaca 5 byte memori flash pada al
 
 ### TAHAP 5: Pembacaan Live Data Sensor (Table 10)
 
-Setelah ECU terhubung, aplikasi meminta data sensor mesin secara periodik (*polling loop* setiap 50 ms – 100 ms).
+Setelah urutan inisialisasi TX selesai, pengguna memulai polling melalui tombol
+**Start Diagnosis** pada dashboard. Request Table 11 pertama dikirim langsung
+setelah tombol ditekan, lalu request table berulang dengan interval 500 ms
+sesuai urutan Analist Pro. Tombol yang sama menghentikan polling; tiga kegagalan transaksi
+berturut-turut juga menghentikan polling dan mereset sesi KWP.
 
 * **TX (Dikirim oleh Tool / ESP32):**
   ```text
@@ -253,7 +267,8 @@ Setelah ECU terhubung, aplikasi meminta data sensor mesin secara periodik (*poll
 Di firmware, `table_data[i]` adalah byte `frame[i+3]` (hasil decode dimulai
 setelah tiga byte awal frame). Karena itu MAP kPa dibaca dari
 `table_data[9]` (setara `frame[12]`) dan speed dari `table_data[14]`
-(setara `frame[17]`). Panjang payload normal adalah 22 byte; parser hanya
+(setara `frame[17]`). Nilai MAP dikalikan 3 saat mengisi
+`map_kpa_quarters`. Panjang payload normal adalah 22 byte; parser hanya
 menolak payload kurang dari 15 byte karena field yang digunakan firmware
 berakhir pada indeks 14.
 
@@ -351,13 +366,21 @@ Untuk menggantikan fungsi chip FTDI pada Analist Pro menggunakan ESP32, ikuti at
    Di firmware, durasi default LOW/HIGH adalah 70/120 ms dan dapat diubah dari
    dashboard. TX tetap dimiliki UART sepanjang pulsa dan pengiriman frame.
 
-3. **Urutan Pemanggilan State Machine:**
-   * Jalankan Fast Init, lalu kirim `FE 04 72 8C` dan validasi `0E 04 72 7C`.
-   * Kirim `72 05 00 F0 99` dan validasi ACK sesi `02 04 00 FA`.
-   * Kirim query model `7E 06 01 01 00 7A`; validasi respons 18-byte yang
-     berisi ID `38770-K15-903`.
-   * Setelah awalan model ID `38770-K15-` tervalidasi, mulai loop pembacaan
-     `72 05 71 10 08` dan validasi checksum respons Table 10.
+3. **Urutan TX firmware berdasarkan capture Analyst Pro:**
+   * Jalankan Fast Init, lalu kirim `FE 04 72 8C`.
+   * Tanpa menunggu ACK, kirim `72 05 00 F0 99` dua kali dengan jeda sekitar
+     65 ms.
+   * Kirim `72 07 72 00 00 05 10`, lalu `7D 06 01 01 03 78` dan
+     `7B 06 02 01 03 79`, masing-masing setelah jeda sekitar 65 ms.
+   * Setelah sesi init selesai, tekan **Start Diagnosis**. Firmware langsung
+     mengirim Table 11, lalu polling Table 10, 13, 16, 17 dan kembali ke 11
+     pada interval 500 ms.
+     Tekan **Stop Diagnosis** untuk menghentikan polling. Sebelum setiap table
+     setelah Table 11 pertama, kirim housekeeping `72 05 71 20 F8` dan
+     `72 05 71 D1 47`; beri jeda agar ECU mendeteksi batas frame.
+   * RX tetap aktif selama rangkaian init, tetapi balasan init tidak menjadi
+     syarat untuk melanjutkan ke frame TX berikutnya. Respons table saat polling
+     tetap diperlukan untuk memvalidasi data.
 
 ---
 

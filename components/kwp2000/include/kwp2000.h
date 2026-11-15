@@ -11,16 +11,16 @@
 extern "C" {
 #endif
 
-// Set per jalur sesuai rangkaian inverter K-Line yang digunakan.
-#define KLINE_TX_INVERTING 1
-#define KLINE_RX_INVERTING 1
+// Set per jalur sesuai rangkaian K-Line yang digunakan (0 = non-inverting / standard TTL, 1 = inverting)
+#define KLINE_TX_INVERTING 0
+#define KLINE_RX_INVERTING 0
 
 #define KWP_FRAME_MAX_SIZE 256
 #define KWP_RX_HISTORY_SIZE 1024
 
-// Honda CB150R KWP2000 Addresses & Commands
-#define KWP_HONDA_DESTINATION          0x72
-#define KWP_HONDA_REQUEST_ALL          0x71
+// H-Diag K-Line frame values
+#define KWP_HDIAG_FRAME_HEADER         0xFE
+#define KWP_HDIAG_SERVICE              0x72
 
 // Frame structure
 typedef struct {
@@ -51,6 +51,10 @@ typedef struct {
 // Inisialisasi awal port & driver K-Line
 void kwp2000_init(int rx_gpio, int tx_gpio, int baudrate);
 
+// Pengaturan polaritas sinyal UART (inverting untuk sirkuit transistor 12V, non-inverting untuk TTL langsung)
+void kwp2000_set_inversion(bool tx_invert, bool rx_invert);
+void kwp2000_get_inversion(bool *tx_invert, bool *rx_invert);
+
 // Eksekusi Fast Init melalui UART dengan parameter timing yang diberikan.
 bool kwp2000_fast_init(const kwp_init_params_t *params);
 
@@ -61,6 +65,9 @@ void kwp2000_stop_tx_hardware_test(void);
 // Mulai sesi diagnostik Honda K-Line
 bool kwp2000_begin_diagnostic_session(uint8_t session_type,
                                       const kwp_init_params_t *params);
+
+// Kirim byte transisi 00 01 saat start request diagnosis
+bool kwp2000_send_diagnosis_transition(void);
 
 // Reset status sesi diagnostik
 void kwp2000_reset_session(void);
@@ -76,6 +83,9 @@ bool kwp2000_read_data_by_id(uint16_t data_id,
                              uint8_t *response,
                              size_t response_capacity,
                              uint8_t *response_len);
+
+// Keep-Alive Heartbeat untuk menjaga sesi ECU tetap aktif saat standby
+bool kwp2000_send_keep_alive(void);
 
 size_t kwp2000_copy_rx_history(uint8_t *buffer,
                                size_t capacity,
