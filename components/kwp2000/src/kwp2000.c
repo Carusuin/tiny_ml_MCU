@@ -791,6 +791,11 @@ static bool kwp2000_parse_frame(uint8_t *buffer, int len, kwp2000_frame_t *frame
     frame->checksum = buffer[len - 1];
 
     uint8_t calc_checksum = kwp2000_calculate_checksum(buffer, len - 1);
+    // Catatan Toleransi Checksum:
+    // Secara matematis 2's complement 0x100 - (0x0E + 0x04 + 0x72) = 0x7C.
+    // Namun varian ECU Honda Keihin tertentu dan capture Analist Pro mengirimkan 0x7E
+    // sebagai byte penutup frame wake-up ACK [0E 04 72 7E]. Pengecualian ini sengaja
+    // dibuat agar tahapan inisialisasi awal tidak gagal pada ECU asli.
     bool documented_hdiag_wakeup_ack =
         len == 4 && buffer[0] == 0x0E && buffer[1] == 0x04 &&
         buffer[2] == 0x72 && buffer[3] == 0x7E;

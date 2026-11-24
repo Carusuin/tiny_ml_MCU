@@ -21,12 +21,13 @@
 
 #include "kwp2000.h"
 #include "sd_logger.h"
+#include "adxl345.h"
 
 static const char *TAG = "APP_MAIN";
 
 #define WEB_LOG_LINE_COUNT 128
 #define WEB_LOG_LINE_SIZE 256
-#define KWP_POLL_INTERVAL_US 100000LL
+#define KWP_POLL_INTERVAL_US 80000LL
 
 static char web_log_lines[WEB_LOG_LINE_COUNT][WEB_LOG_LINE_SIZE];
 static size_t web_log_line_capacity = 64;
@@ -100,6 +101,9 @@ static void web_log_clear(void)
 #define KLINE_TX_GPIO  17
 #define KLINE_BAUDRATE 10400
 
+#define ADXL345_SDA_GPIO 21
+#define ADXL345_SCL_GPIO 22
+
 #define WIFI_SSID "Honda_KWP2000"
 #define WIFI_PASS "12345678"
 
@@ -114,6 +118,9 @@ typedef struct {
     uint16_t tps_percent_tenths;
     uint16_t map_kpa_quarters;
     uint8_t dtc_count;
+    float accel_x;
+    float accel_y;
+    float accel_z;
     uint32_t timestamp_ms;
     char status_text[32];
     bool sd_card_available;
@@ -128,6 +135,9 @@ static ecu_status_t current_status = {
     .tps_percent_tenths = 0,
     .map_kpa_quarters = 0,
     .dtc_count = 0,
+    .accel_x = 0.0f,
+    .accel_y = 0.0f,
+    .accel_z = 0.0f,
     .timestamp_ms = 0,
     .status_text = "waiting",
     .sd_card_available = false
@@ -139,7 +149,7 @@ static const char *dashboard_html = R"html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Honda ECU Dashboard</title>
+  <title>Honda ECU & ADXL345 Dashboard</title>
   <style>
     body { font-family: Arial, sans-serif; background: #101827; color: white; margin: 0; padding: 24px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
@@ -154,7 +164,7 @@ static const char *dashboard_html = R"html(
   </style>
 </head>
 <body>
-  <h1>Honda ECU Dashboard</h1>
+  <h1>Honda ECU & ADXL345 Dashboard</h1>
   <div class="row">
     <div class="label">Connection</div>
     <div id="state" class="status">Connecting...</div>
@@ -166,6 +176,9 @@ static const char *dashboard_html = R"html(
     <div class="card"><div class="label">TPS</div><div id="tps" class="value">0.0%</div></div>
     <div class="card"><div class="label">MAP</div><div id="map" class="value">0.00 kPa</div></div>
     <div class="card"><div class="label">DTC</div><div id="dtc" class="value">0</div></div>
+    <div class="card"><div class="label">Acc X</div><div id="accX" class="value">0.00 g</div></div>
+    <div class="card"><div class="label">Acc Y</div><div id="accY" class="value">0.00 g</div></div>
+    <div class="card"><div class="label">Acc Z</div><div id="accZ" class="value">0.00 g</div></div>
   </div>
   <div class="card" style="margin-top:20px;">
     <div class="label">DTC Codes</div>
@@ -226,6 +239,9 @@ static const char *dashboard_html = R"html(
         document.getElementById('map').textContent =
           (data.map_kpa_quarters / 4).toFixed(2) + ' kPa';
         document.getElementById('dtc').textContent = data.dtc_count;
+        document.getElementById('accX').textContent = data.accel_x.toFixed(2) + ' g';
+        document.getElementById('accY').textContent = data.accel_y.toFixed(2) + ' g';
+        document.getElementById('accZ').textContent = data.accel_z.toFixed(2) + ' g';
         const sd = document.getElementById('sdState');
         sd.textContent = data.sd_card_available ? 'SD card ready' : 'SD card not detected';
         sd.className = data.sd_card_available ? 'status' : 'warn';
@@ -346,11 +362,23 @@ static const char *dashboard_html = R"html(
       document.getElementById('txTestMessage').textContent =
         data.success ? 'TX released' : data.error;
     }
-    loadStatus(); loadDtc(); loadLogs(); loadRxBytes();
-    setInterval(loadStatus, 200);
-    setInterval(loadDtc, 3000);
-    setInterval(loadLogs, 500);
-    setInterval(loadRxBytes, 500);
+    async function statusLoop() {
+      await loadStatus();
+      setTimeout(statusLoop, 100);
+    }
+    async function logLoop() {
+      await loadLogs();
+      setTimeout(logLoop, 1500);
+    }
+    async function rxByteLoop() {
+      await loadRxBytes();
+      setTimeout(rxByteLoop, 1500);
+    }
+    loadDtc();
+    statusLoop();
+    logLoop();
+    rxByteLoop();
+    setInterval(loadDtc, 4000);
   </script>
 </body>
 </html>
@@ -359,6 +387,8 @@ static const char *dashboard_html = R"html(
 static esp_err_t dashboard_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
     return httpd_resp_send(req, dashboard_html, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -371,7 +401,7 @@ static const httpd_uri_t uri_root = {
 
 static esp_err_t status_json_handler(httpd_req_t *req)
 {
-    char json[384];
+    char json[512];
     ecu_status_t snapshot_status;
 
     if (status_mutex == NULL ||
@@ -394,7 +424,7 @@ static esp_err_t status_json_handler(httpd_req_t *req)
     xSemaphoreGive(diagnostic_state_mutex);
 
     snprintf(json, sizeof(json),
-        "{\"ecu_connected\":%s,\"session_initialized\":%s,\"diagnosis_active\":%s,\"rpm\":%u,\"speed_kph\":%u,\"coolant_temp_c\":%d,\"tps_percent_tenths\":%u,\"map_kpa_quarters\":%u,\"dtc_count\":%u,\"status_text\":\"%s\",\"sd_card_available\":%s}",
+        "{\"ecu_connected\":%s,\"session_initialized\":%s,\"diagnosis_active\":%s,\"rpm\":%u,\"speed_kph\":%u,\"coolant_temp_c\":%d,\"tps_percent_tenths\":%u,\"map_kpa_quarters\":%u,\"dtc_count\":%u,\"accel_x\":%.2f,\"accel_y\":%.2f,\"accel_z\":%.2f,\"status_text\":\"%s\",\"sd_card_available\":%s}",
         snapshot_status.ecu_connected ? "true" : "false",
         session_initialized ? "true" : "false",
         diagnosis_active ? "true" : "false",
@@ -404,10 +434,14 @@ static esp_err_t status_json_handler(httpd_req_t *req)
         (unsigned)snapshot_status.tps_percent_tenths,
         (unsigned)snapshot_status.map_kpa_quarters,
         (unsigned)snapshot_status.dtc_count,
+        snapshot_status.accel_x,
+        snapshot_status.accel_y,
+        snapshot_status.accel_z,
         snapshot_status.status_text,
         snapshot_status.sd_card_available ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -436,6 +470,7 @@ static esp_err_t dtc_json_handler(httpd_req_t *req)
              "{\"dtc_count\":%u,\"codes\":[]}",
              snapshot_status.dtc_count);
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -842,17 +877,52 @@ static void queue_consumer_task(void *arg)
     while (1) {
         if (xQueueReceive(ecu_queue, &status, portMAX_DELAY) == pdTRUE) {
             if (status_mutex && xSemaphoreTake(status_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                // Pertahankan nilai akselerasi terbaru dari ADXL345
+                status.accel_x = current_status.accel_x;
+                status.accel_y = current_status.accel_y;
+                status.accel_z = current_status.accel_z;
                 current_status = status;
                 current_status.sd_card_available = sd_logger_is_available();
                 xSemaphoreGive(status_mutex);
             }
 
-            sd_logger_log_ecu_status(status.timestamp_ms,
-                                     status.ecu_connected,
-                                     status.rpm,
-                                     status.speed_kph,
-                                     status.coolant_temp_c,
-                                     status.dtc_count);
+            sd_logger_log_status(status.timestamp_ms,
+                                 status.ecu_connected,
+                                 status.rpm,
+                                 status.tps_percent_tenths,
+                                 status.map_kpa_quarters,
+                                 status.coolant_temp_c,
+                                 status.speed_kph,
+                                 status.accel_x,
+                                 status.accel_y,
+                                 status.accel_z);
+        }
+    }
+}
+
+static void adxl345_task(void *arg)
+{
+    ESP_LOGI(TAG, "ADXL345 task started on core %d", xPortGetCoreID());
+    bool adxl_ok = adxl345_init(ADXL345_SDA_GPIO, ADXL345_SCL_GPIO, 400000);
+
+    while (1) {
+        if (adxl_ok) {
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            if (adxl345_read_accel(&x, &y, &z)) {
+                if (status_mutex && xSemaphoreTake(status_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    current_status.accel_x = x;
+                    current_status.accel_y = y;
+                    current_status.accel_z = z;
+                    xSemaphoreGive(status_mutex);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(50)); // 20 Hz accelerometer update
+        } else {
+            // Jika sensor belum terpasang fisik, tidur hemat daya 2 detik
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            if (adxl345_is_available()) {
+                adxl_ok = true;
+            }
         }
     }
 }
@@ -1054,9 +1124,17 @@ void app_test_kwp2000(void *arg)
             consecutive_failures = 0;
             status.ecu_connected = true;
             if (table_id == 0x10) {
-                status.rpm = ((uint16_t)table_data[1] << 8) | table_data[2];
-                status.tps_percent_tenths = (uint16_t)table_data[4] * 5;
-                status.coolant_temp_c = (int16_t)table_data[6] - 40;
+                // Pemetaan presisi sesuai dekompilasi Analist Pro & HONDA_K15_KLINE_PROTOCOL.md:
+                // table_data[0]    = frame[3] (Table ID: 0x10)
+                // table_data[1]    = frame[4] (TPS Volt)
+                // table_data[2]    = frame[5] (TPS %: byte * 0.5%)
+                // table_data[3..4] = frame[6..7] (Engine RPM: byte3 * 256 + byte4)
+                // table_data[5]    = frame[8] (ECT / Coolant: byte - 40 C)
+                // table_data[9]    = frame[12] (MAP: byte * 0.75 kPa)
+                // table_data[14]   = frame[17] (Vehicle Speed: byte km/h)
+                status.rpm = ((uint16_t)table_data[3] << 8) | table_data[4];
+                status.tps_percent_tenths = (uint16_t)table_data[2] * 5;
+                status.coolant_temp_c = (int16_t)table_data[5] - 40;
                 status.map_kpa_quarters = (uint16_t)table_data[9] * 3;
                 status.speed_kph = table_data[14];
             }
@@ -1136,6 +1214,9 @@ extern "C" void app_main(void)
 
     wifi_init_softap();
     start_webserver();
+
+    // Jalankan task ADXL345 di Core 0 (bersama WiFi & Web, terpisah dari K-Line di Core 1)
+    xTaskCreatePinnedToCore(adxl345_task, "adxl345_task", 3072, NULL, 3, NULL, 0);
 
     ESP_LOGI(TAG, "Application initialized");
 }
